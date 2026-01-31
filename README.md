@@ -690,7 +690,6 @@ MIT License - see [LICENSE](LICENSE) file for details
 
 - **Issues**: [GitHub Issues](https://github.com/yourusername/agentforge/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/yourusername/agentforge/discussions)
-- **Twitter**: [@AgentForgeAI](https://twitter.com)
 - **Email**: aarizwaqqas3@gmail.com
 
 ---
