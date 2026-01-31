@@ -1,0 +1,10 @@
+{
+  "summary": "summary",
+  "agents": [
+    {
+      "agentId": "a1",
+      "role": "worker",
+      "summary": "did work"
+    }
+  ]
+}

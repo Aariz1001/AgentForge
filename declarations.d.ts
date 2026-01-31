@@ -1,0 +1,12 @@
+declare module 'gradient-string';
+declare module 'figlet';
+declare module 'inquirer';
+declare module 'boxen';
+declare module 'ora';
+declare module 'eventsource';
+declare module 'helmet';
+declare module 'morgan';
+declare module 'cors';
+declare module 'inquirer-autocomplete-prompt';
+declare module 'marked-terminal';
+declare module 'figures';

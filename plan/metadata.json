@@ -1,0 +1,18 @@
+{
+  "project_name": "_1_executive_summary",
+  "generated_at": "2026-01-28T13:48:37.363238",
+  "supported_by": [
+    "Grok",
+    "GPT",
+    "Gemini",
+    "ZAI",
+    "Kimi"
+  ],
+  "project_root": "projects\\project__1_executive_summary_20260128_134837",
+  "plan_folder": "projects\\project__1_executive_summary_20260128_134837\\plan",
+  "build_folder": "projects\\project__1_executive_summary_20260128_134837\\build",
+  "has_database": true,
+  "has_frontend": true,
+  "has_backend": true,
+  "task_count": 3
+}
