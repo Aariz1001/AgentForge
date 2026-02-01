@@ -21,6 +21,7 @@ import readline from 'readline';
 import { BackendClient } from '../services/BackendClient';
 import { AgentSkill, SessionManager, SessionStats } from '../services/SessionManager';
 import { MCPClient } from '../services/MCPClient';
+import { ProviderManager } from '../services/ProviderManager';
 import { ForgeUI } from './ForgeUI';
 import { tools, registerDynamicTool } from '../tools/index';
 import { displayError, displayInfo, displaySuccess, clearLine, toolOutput } from '../utils/display';
@@ -28,6 +29,12 @@ import { displayError, displayInfo, displaySuccess, clearLine, toolOutput } from
 // Blue pointer character for the prompt
 const POINTER = chalk.cyan('›');
 const POINTER_ACTIVE = chalk.blue('▶');
+
+interface CommandDefinition {
+  name: string;
+  description: string;
+  usage: string;
+}
 
 // Register autocomplete prompt
 inquirer.registerPrompt('autocomplete', autocomplete);
@@ -56,8 +63,9 @@ CORE CAPABILITIES:
 7. Specialized Knowledge: You can access MCP (Model Context Protocol) servers for up-to-date documentation and specialized skills. Use \`mcp\` to query servers like 'context7' (for library docs) and 'langchain' (for LangChain info).
 8. Engineering Skills: Use the \`skill\` tool to discover and read expert engineering pattern libraries (e.g., 'openrouter-typescript-sdk', 'frontend-design').
 9. Terminal Control: For background processes, use \`shell_output\` to check progress and \`shell_kill\` to stop them. If a command fails and you missed the output, use \`shell_output\` with \`last: true\`.
-10. Tool Inventory: Use \`inventory\` to discover all available tools, including specialized toolkits (e.g., 'Virtual_Phone_Controller'). If you feel you are missing a capability, check the inventory first.
+10. Tool Inventory: Use \`inventory\` to discover all available tools, including specialized toolkits (e.g., 'Virtual_Phone_Controller', 'Autonomous_Browser_Toolkit'). If you feel you are missing a capability, check the inventory first.
 11. Hardware & Mobile Interface: You can control virtual and physical devices via the \`Virtual_Phone_Controller\` toolkit. This provides "vision" (extracting screenshots and dumping UI hierarchy XML), "fingertip" control (tapping/swiping/click-by-text), "typing" (injecting text), and "system relay" (low-level ADB shell access). Screenshots are provided to you as direct image inputs, allowing you to "see" exactly what is on the device screen.
+12. Web Automation & Browser Control: You have full autonomous web browsing capabilities via the \`Autonomous_Browser_Toolkit\`. This provides browser management (launch/close), navigation, element interaction (click/type/hover), data extraction, screenshot capture for vision analysis, form automation, JavaScript execution, session persistence (cookies/localStorage), intelligent page analysis, and smart waiting strategies. Use these tools for web research, testing, data extraction, form filling, and complex multi-step web workflows.
 
 TEST-DRIVEN DEVELOPMENT (TDD) MANDATE:
 - ALWAYS write a test (via \`write\` or \`edit\`) for any new feature or fix BEFORE implementing it. 
@@ -69,7 +77,8 @@ KNOWLEDGE ACQUISITION:
 - **Up-to-date Docs**: When working with modern libraries (Next.js, Tailwind, MongoDB, etc.), ALWAYS check \`mcp\` action: "call" with server: "context7", toolName: "query-docs". It provides the latest API references and examples. (Example libraryIds: /vercel/next.js, /mongodb/docs).
 - **Expert Patterns**: Before starting a specific domain task (e.g., UI building, API integration), check \`skill\` action: "list" and "read" the relevant skill. These are curated by experts to ensure top-tier code quality.
 - **Mobile Vision & Control**: If a task requires interacting with a mobile app or device, immediately run \`inventory toolkit: "Virtual_Phone_Controller"\`. Use \`VisualInterface\` to "see" (screenshot/dump_hierarchy) and "act" (tap/swipe/tap_by_text) on the device. Dumping the hierarchy is often superior to screenshots for identifying button IDs and text segments. Use \`DeviceOrchestrator\` to manage its state.
-- **Toolkit Discovery**: If a task requires specific hardware or domain integration (e.g., "use the phone", "interact with the device"), ALWAYS run \`inventory\` to see if a specialized toolkit is already forged. Toolkits are collections of tools prefixed by their name (e.g., \`Virtual_Phone_Controller_...\`).
+- **Web Automation**: For web browsing, scraping, testing, or automation tasks, use the \`Autonomous_Browser_Toolkit\`. Start with BrowserController to launch a browser, then use Navigator for navigation, ElementInteractor for interactions, DataExtractor for content, VisionCapture for screenshots, FormAutomation for forms, PageAnalyzer for structure analysis, and WaitStrategy for dynamic content. The toolkit supports headless/headed modes, multiple tabs, session persistence, and JavaScript execution.
+- **Toolkit Discovery**: If a task requires specific hardware or domain integration (e.g., "use the phone", "interact with the device", "browse the web"), ALWAYS run \`inventory\` to see if a specialized toolkit is already forged. Toolkits are collections of tools prefixed by their name (e.g., \`Virtual_Phone_Controller_...\`, \`Autonomous_Browser_Toolkit_...\`).
 - **Exploration First**: Before acting, always \`list\` the root and key directories. Never assume the presence of a file.
 
 PROJECT DISCIPLINE & EXPLORATION:
@@ -125,6 +134,7 @@ export class ChatSession {
   private client: BackendClient;
   private sessionManager: SessionManager;
   private mcpClient: MCPClient;
+  private providerManager: ProviderManager;
   private model: string;
   private sessionId: string;
   private stream: boolean;
@@ -149,13 +159,18 @@ export class ChatSession {
   private compactingContext: boolean = false;
   private permittedTools: Set<string> = new Set();
   private pendingImage: string | null = null;
+  private interrupted: boolean = false;
 
   constructor(options: any = {}) {
     this.config = options.config;
     this.client = new BackendClient(this.config);
     this.sessionManager = new SessionManager();
     this.mcpClient = new MCPClient();
-    this.model = options.model || this.config.get('openrouter.model');
+    this.providerManager = new ProviderManager(this.config);
+    
+    // Get model from the active provider's config
+    const activeProvider = this.providerManager.getActiveProviderType();
+    this.model = options.model || this.config.get(`${activeProvider}.model`) || this.config.get('openrouter.model');
     this.sessionId = options.sessionId || this.generateSessionId();
     this.stream = options.stream !== false;
     
@@ -164,6 +179,7 @@ export class ChatSession {
     
     this.workingDirectory = process.cwd();
     this.loadHistory();
+    
     this.sessionManager.syncLocalSkills();
     this.updateSystemPrompt();
     this.setupFatalHandlers();
@@ -342,10 +358,17 @@ export class ChatSession {
       this.sessionManager.addMessage('system', SYSTEM_PROMPT);
     }
     
-    console.log(chalk.gray(`Session: ${this.sessionId}`));
-    console.log(chalk.gray(`Model: ${this.model}`));
-    console.log(chalk.gray('─'.repeat(60)));
-    console.log(chalk.gray('Type /help for commands, /exit to quit\n'));
+    // Display session info with provider
+    const activeProvider = this.providerManager.getActiveProviderType();
+    const providerDisplay = activeProvider === 'copilot' ? 'GitHub Copilot' : 'OpenRouter';
+    
+    console.log(boxen(
+      chalk.cyan.bold('AgentForge') + '\n\n' +
+      chalk.white('Session:  ') + chalk.gray(this.sessionId) + '\n' +
+      chalk.white('Provider: ') + chalk.cyan(providerDisplay) + '\n' +
+      chalk.white('Model:    ') + chalk.cyan(this.model) + '\n\n' +
+      chalk.gray('Commands: /help   Exit: /exit   Interrupt: Ctrl+C (twice)')
+    , { padding: 1, borderColor: 'cyan' }));
     
     while (this.running) {
       try {
@@ -430,8 +453,8 @@ export class ChatSession {
     }
   }
   
-  async promptUser(): Promise<void> {
-    const commands = [
+  private getCommands(): CommandDefinition[] {
+    return [
       { name: 'exit', description: 'Exit the session', usage: '/exit' },
       { name: 'quit', description: 'Quit the session', usage: '/quit' },
       { name: 'q', description: 'Quick exit', usage: '/q' },
@@ -440,6 +463,7 @@ export class ChatSession {
       { name: 'clear', description: 'Clear screen', usage: '/clear' },
       { name: 'c', description: 'Quick clear', usage: '/c' },
       { name: 'history', description: 'Show message history', usage: '/history' },
+      { name: 'provider', description: 'Switch LLM provider (openrouter/copilot)', usage: '/provider [name]' },
       { name: 'model', description: 'Get/set model (persists)', usage: '/model [model_id]' },
       { name: 'config', description: 'View/update config', usage: '/config view' },
       { name: 'tools', description: 'List available tools', usage: '/tools' },
@@ -453,14 +477,15 @@ export class ChatSession {
       { name: 'mcp', description: 'Manage MCP servers', usage: '/mcp [list|add|remove|connect]' },
       { name: 'skills', description: 'Manage agent skills', usage: '/skills [list|sync|add|remove|toggle]' },
       { name: 'stats', description: 'Show session statistics', usage: '/stats' },
-      { name: 'swarm', description: 'Run swarm mode', usage: '/swarm <task>' }
+      { name: 'swarm', description: 'Run swarm mode', usage: '/swarm <task>' },
+      { name: 'cancel', description: 'Cancel current operation (ESC)', usage: '/cancel' },
+      { name: 'interrupt', description: 'Interrupt agent response (ESC)', usage: '/interrupt' }
     ];
+  }
 
+  async promptUser(): Promise<void> {
+    const commands = this.getCommands();
     try {
-      this.printInputBorder('top');
-      
-      // Session cost indicator removed from prompt
-      
       // Get user input
       const input = await this.readlineWithAutocomplete(commands);
       const trimmed = (input ?? '').trim();
@@ -470,32 +495,38 @@ export class ChatSession {
       // Save to history
       this.saveHistory(trimmed);
       
-      // Show command list when user types only "/"
-      if (trimmed === '/') {
-        const { command }: any = await inquirer.prompt([
-          {
-            type: 'list',
-            name: 'command',
-            message: 'Select command:',
-            choices: [
-              ...commands.map(c => ({
-                name: `${c.usage.padEnd(30)} ${c.description}`,
-                value: c.usage.split(' ')[0]
-              })),
-              new inquirer.Separator(),
-              { name: 'Cancel', value: null }
-            ]
+      // Handle commands
+      if (trimmed.startsWith('/')) {
+        // Special case for just "/" - show all commands
+        if (trimmed === '/') {
+          const { command }: any = await inquirer.prompt([
+            {
+              type: 'list',
+              name: 'command',
+              message: 'Select command:',
+              pageSize: 15,
+              choices: [
+                ...commands.map(c => ({
+                  name: `${chalk.green(c.usage.padEnd(25))} ${chalk.gray(c.description)}`,
+                  value: c.usage.split(' ')[0]
+                })),
+                new inquirer.Separator(),
+                { name: 'Cancel', value: null }
+              ]
+            }
+          ]);
+          if (command) {
+            await this.handleCommand(command);
           }
-        ]);
-        if (command) {
-          await this.handleCommand(command);
+        } else {
+          await this.handleCommand(trimmed);
         }
         return;
       }
       
-      // Handle commands
-      if (trimmed.startsWith('/')) {
-        await this.handleCommand(trimmed);
+      // Check for cancel/interrupt
+      if (this.interrupted) {
+        this.interrupted = false;
         return;
       }
       
@@ -524,9 +555,9 @@ export class ChatSession {
       {
         type: 'autocomplete',
         name: 'userInput',
-        message: chalk.blue('▶  '),
+        message: chalk.blue('▶'),
         prefix: '',
-        pageSize: 10,
+        pageSize: 15,
         suggestOnly: true,
         source: async (answers: any, input: string) => {
           input = input || '';
@@ -547,7 +578,6 @@ export class ChatSession {
           }
 
           // Search History - only shown when typing and not a command
-          // and only if user has typed at least 2 chars to avoid "jarring" popups
           if (input.length > 1) {
             const matches = this.history
               .filter(h => h.toLowerCase().includes(query))
@@ -562,13 +592,20 @@ export class ChatSession {
       }
     ]);
 
+    // Clean up the box bottom after input
+    process.stdout.write(chalk.gray('└' + '─'.repeat(Math.max(0, (process.stdout.columns || 80) - 2)) + '┘\n'));
+
     return result.userInput;
   }
 
   printInputBorder(position: 'top' | 'bottom'): void {
     const terminalWidth = process.stdout.columns || 80;
     const border = chalk.gray('─'.repeat(Math.max(0, terminalWidth - 2)));
-    console.log(border);
+    if (position === 'top') {
+      console.log('\n' + border);
+    } else {
+      console.log(border + '\n');
+    }
   }
   
   async handleCommand(command: string): Promise<void> {
@@ -679,6 +716,16 @@ export class ChatSession {
         case 'swarm':
           await this.runSwarm(args.join(' '));
           break;
+
+        case 'provider':
+          await this.handleProviderCommand(args);
+          break;
+
+        case 'cancel':
+        case 'interrupt':
+          this.interrupted = true;
+          console.log(chalk.yellow('Operation cancelled'));
+          break;
           
         default:
           console.log(chalk.yellow(`Unknown command: ${cmd}`));
@@ -704,6 +751,10 @@ export class ChatSession {
       '/model custom      Select provider & custom model\n' +
       '/config view       Show current configuration\n' +
       '/config set k v    Update a config value\n\n' +
+      chalk.cyan('Provider:\n') +
+      '/provider          Show/switch LLM provider\n' +
+      '/provider copilot  Switch to GitHub Copilot\n' +
+      '/provider openrouter Switch to OpenRouter\n\n' +
       chalk.cyan('Tools & Skills:\n') +
       '/tools             List available tools\n' +
       '/forge <desc>      Create a new tool\n' +
@@ -713,6 +764,10 @@ export class ChatSession {
       '/credits           Show account balance\n' +
       '/cost              Show session cost\n' +
       '/stats             Show session statistics\n\n' +
+      chalk.cyan('Interrupts:\n') +
+      'ESC                Cancel current input/operation\n' +
+      '/cancel            Cancel current operation\n' +
+      '/interrupt         Interrupt agent response\n\n' +
       '/swarm <task>      Run swarm mode\n' +
       '/help, /h          Show this help',
       { padding: 1, borderColor: 'blue', title: 'Help' }
@@ -984,6 +1039,96 @@ export class ChatSession {
       default:
         console.log(chalk.gray('Usage: /mcp [list|add|remove|toggle|connect] [args]'));
     }
+  }
+
+  /**
+   * Handle provider switching command
+   */
+  private async handleProviderCommand(args: string[]): Promise<void> {
+    const subCmd = args[0]?.toLowerCase();
+
+    // If no argument, show current provider and available options
+    if (!subCmd) {
+      const activeProvider = this.providerManager.getActiveProviderType();
+      const providerDisplay = activeProvider === 'copilot' ? 'GitHub Copilot' : 'OpenRouter';
+      
+      console.log(chalk.bold('\nLLM Provider:\n'));
+      console.log(`  Current: ${chalk.cyan(providerDisplay)}`);
+      console.log('');
+      console.log(chalk.gray('  Available providers:'));
+      console.log(`    ${chalk.cyan('openrouter')}  - OpenRouter API (multiple models)`);
+      console.log(`    ${chalk.cyan('copilot')}     - GitHub Copilot (Pro/Pro+ subscription)`);
+      console.log('');
+      console.log(chalk.gray('  Usage: /provider <name>'));
+      console.log(chalk.gray('  Example: /provider copilot'));
+      console.log('');
+      return;
+    }
+
+    // Switch to specified provider
+    if (subCmd === 'openrouter' || subCmd === 'or') {
+      try {
+        await this.providerManager.setActiveProvider('openrouter');
+        this.model = this.config.get('openrouter.model') || 'openai/gpt-4o';
+        console.log(chalk.green(`\n✓ Switched to OpenRouter`));
+        console.log(`  Model: ${chalk.cyan(this.model)}`);
+        console.log('');
+      } catch (error: any) {
+        displayError('Failed to switch provider', error.message);
+      }
+      return;
+    }
+
+    if (subCmd === 'copilot' || subCmd === 'github' || subCmd === 'gh') {
+      try {
+        // Check if Copilot is available/authenticated
+        const copilotService = this.client.getCopilotService();
+        
+        if (!copilotService) {
+          console.log(chalk.yellow('\n⚠ Copilot service not available'));
+          console.log(chalk.gray('  Make sure @github/copilot-sdk is installed'));
+          return;
+        }
+
+        const isAvailable = await copilotService.isAvailable();
+        
+        if (!isAvailable) {
+          console.log(chalk.yellow('\n⚠ GitHub Copilot not authenticated'));
+          console.log(chalk.gray('  Attempting to authenticate...\n'));
+          
+          const authSuccess = await copilotService.authenticate();
+          
+          if (!authSuccess) {
+            console.log(chalk.red('\n✖ Authentication failed'));
+            console.log(chalk.gray('  Make sure you have:'));
+            console.log(chalk.gray('    1. GitHub CLI (gh) installed'));
+            console.log(chalk.gray('    2. A GitHub Copilot Pro or Pro+ subscription'));
+            return;
+          }
+        }
+
+        await this.providerManager.setActiveProvider('copilot');
+        this.model = this.config.get('copilot.model') || 'gpt-4o';
+        
+        console.log(chalk.green(`\n✓ Switched to GitHub Copilot`));
+        console.log(`  Model: ${chalk.cyan(this.model)}`);
+        
+        // Show usage info
+        const info = await copilotService.getInfo();
+        if (info.usage) {
+          console.log(`  Usage: ${chalk.cyan(`${info.usage.used}/${info.usage.limit}`)} requests this month`);
+        }
+        console.log('');
+      } catch (error: any) {
+        displayError('Failed to switch to Copilot', error.message);
+      }
+      return;
+    }
+
+    // Unknown provider
+    console.log(chalk.yellow(`\n⚠ Unknown provider: ${subCmd}`));
+    console.log(chalk.gray('  Available: openrouter, copilot'));
+    console.log('');
   }
 
   private async handleSkillsCommand(args: string[]): Promise<void> {
@@ -1715,7 +1860,7 @@ export class ChatSession {
         let buffer = '';
         const streamState = { rawBuffer: '' };
         spinner.stop();
-        process.stdout.write(chalk.green('Agent: '));
+        process.stdout.write('\n' + chalk.green('Agent: '));
         
         const reasoningConfig = this.config.get('openrouter.reasoning');
         const reasoningOptions = reasoningConfig?.enabled ? { reasoning: reasoningConfig } : {};
@@ -2307,12 +2452,12 @@ export class ChatSession {
     const toolkitName = request.name || (isToolkit ? 'unified_toolkit' : `custom_tool_${Date.now().toString(36)}`);
     
     const spinner = ora({
-      text: chalk.yellow(`🔥 Forging ${isToolkit ? 'toolkit' : 'tool'}...`),
+      text: chalk.yellow(`🔥 Forging ${isToolkit ? 'toolkit' : 'tool'} (Pass 1/3)...`),
       spinner: 'dots'
     }).start();
     
     try {
-      const { writeFile, mkdir } = await import('fs/promises');
+      const { writeFile, mkdir, readFile } = await import('fs/promises');
       const { join, resolve, dirname } = await import('path');
       const { fileURLToPath } = await import('url');
       const { registerForgedToolFromFile } = await import('../tools/index');
@@ -2334,12 +2479,14 @@ export class ChatSession {
         outputs: request.outputs
       }];
 
+      // Use the active provider and current model instead of hardcoded values
+      const activeProvider = this.providerManager.getActiveProviderType();
+      const forgingModel = this.model;
       const forgedPaths: string[] = [];
-      const forgingModel = 'moonshotai/kimi-k2.5';
-      const fallbackModel = this.model || 'anthropic/claude-3.5-sonnet';
+      const forgedTools: Array<{name: string, path: string, code: string}> = [];
 
       for (const t of toolsToForge) {
-        spinner.text = chalk.yellow(`🔥 Generating component: ${chalk.bold(t.name)}...`);
+        spinner.text = chalk.yellow(`🔥 Pass 1/3: Generating ${chalk.bold(t.name)}...`);
         
         const systemPrompt = `You are an expert TypeScript developer for the AgentForge kernel. 
 Generate a complete, safe TypeScript tool implementation that fits the AgentForge architecture.
@@ -2386,75 +2533,182 @@ Outputs: ${t.outputs || 'Infer'}
 
 Context: ${request.reason || 'No additional context'}`;
 
+        // PASS 1: Initial generation
         let generatedCode: string = '';
         try {
           let result: any = await this.client.streamOpenRouter(
             [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
             () => {},
-            { temperature: 1.0, model: forgingModel, reasoning: true, include_reasoning: true }
+            { temperature: 1.0, model: forgingModel }
           );
           generatedCode = result.content;
         } catch (error: any) {
-          spinner.text = chalk.yellow(`Fallback forging for ${t.name}...`);
-          let result: any = await this.client.streamOpenRouter(
-            [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-            () => {},
-            { temperature: 0.2, model: fallbackModel }
-          );
-          generatedCode = result.content;
+          throw new Error(`Pass 1 failed: ${error.message}`);
         }
 
-        // Better code extraction logic
-        const tsMatch = generatedCode.match(/```(?:typescript|ts)\n([\s\S]*?)```/) 
-                    || generatedCode.match(/```\n([\s\S]*?)```/);
+        // Extract code from markdown if present
+        generatedCode = this.extractCodeFromMarkdown(generatedCode);
         
-        if (tsMatch) {
-          generatedCode = tsMatch[1];
-        } else {
-          // Fallback: try to strip any preamble before the first import or export
-          const codeStart = generatedCode.search(/(import|export|const|function|async|class)\s/);
-          if (codeStart !== -1) {
-            generatedCode = generatedCode.slice(codeStart);
-          }
-          
-          // Strip trailing markdown if any
-          const codeEnd = generatedCode.lastIndexOf('```');
-          if (codeEnd !== -1) {
-            generatedCode = generatedCode.slice(0, codeEnd);
-          }
-        }
-        
-        generatedCode = generatedCode.trim();
-        
+        // Save initial version
         const savePath = join(targetDir, `${t.name}.ts`);
         await writeFile(savePath, generatedCode, 'utf-8');
         
-        // Try to register
-        const registered = await registerForgedToolFromFile(t.name, savePath);
-        if (registered) forgedPaths.push(savePath);
+        // PASS 2: Read and improve
+        spinner.text = chalk.yellow(`🔥 Pass 2/3: Improving ${chalk.bold(t.name)}...`);
+        
+        const pass2Prompt = `You are reviewing and improving the TypeScript tool implementation.
+
+ORIGINAL REQUEST:
+Name: ${t.name}
+Purpose: ${t.purpose}
+Inputs: ${t.inputs || 'Infer'}
+Outputs: ${t.outputs || 'Infer'}
+Context: ${request.reason || 'No additional context'}
+
+CURRENT IMPLEMENTATION:
+\`\`\`typescript
+${generatedCode}
+\`\`\`
+
+IMPROVEMENT TASKS:
+1. Verify all error handling is robust and returns proper ToolResult
+2. Ensure type safety and TypeScript best practices
+3. Optimize performance and code quality
+4. Add more descriptive metadata if needed
+5. Ensure the function signature matches requirements
+
+Return ONLY the improved TypeScript code, no explanation.`;
+
+        try {
+          let result: any = await this.client.streamOpenRouter(
+            [{ role: 'user', content: pass2Prompt }],
+            () => {},
+            { temperature: 1.0, model: forgingModel }
+          );
+          generatedCode = this.extractCodeFromMarkdown(result.content);
+          await writeFile(savePath, generatedCode, 'utf-8');
+        } catch (error: any) {
+          console.log(chalk.yellow(`  ⚠ Pass 2 skipped for ${t.name}: ${error.message}`));
+        }
+        
+        // PASS 3: Final refinement
+        spinner.text = chalk.yellow(`🔥 Pass 3/3: Refining ${chalk.bold(t.name)}...`);
+        
+        const pass3Prompt = `Final review and polish of the TypeScript tool.
+
+ORIGINAL REQUEST:
+Name: ${t.name}
+Purpose: ${t.purpose}
+
+CURRENT IMPLEMENTATION:
+\`\`\`typescript
+${generatedCode}
+\`\`\`
+
+FINAL POLISH:
+1. Ensure code is production-ready and follows AgentForge conventions
+2. Verify all edge cases are handled
+3. Check that error messages are clear and actionable
+4. Ensure metadata is complete and accurate
+5. Add any missing imports or dependencies
+
+Return ONLY the final, polished TypeScript code.`;
+
+        try {
+          let result: any = await this.client.streamOpenRouter(
+            [{ role: 'user', content: pass3Prompt }],
+            () => {},
+            { temperature: 0.6, model: forgingModel }
+          );
+          generatedCode = this.extractCodeFromMarkdown(result.content);
+          await writeFile(savePath, generatedCode, 'utf-8');
+        } catch (error: any) {
+          console.log(chalk.yellow(`  ⚠ Pass 3 skipped for ${t.name}: ${error.message}`));
+        }
+        
+        // Store for registration
+        forgedTools.push({ name: t.name, path: savePath, code: generatedCode });
+      }
+      
+      spinner.text = chalk.yellow('Registering tools...');
+      
+      // Register all tools
+      for (const tool of forgedTools) {
+        const registered = await registerForgedToolFromFile(tool.name, tool.path);
+        if (registered) forgedPaths.push(tool.path);
       }
       
       spinner.stop();
       
       if (forgedPaths.length > 0) {
         console.log(chalk.green(`\n🔥 Forged ${isToolkit ? 'toolkit' : 'tool'}: ${chalk.bold(toolkitName)}`));
+        console.log(chalk.gray(`   ${forgedPaths.length} component(s) created with 3-pass refinement`));
         forgedPaths.forEach(p => console.log(chalk.gray(`   ✓ ${p}`)));
         
         this.updateSystemPrompt();
         
+        // Add success message to conversation
+        const toolNames = forgedPaths.map(p => {
+          const parts = p.split(/[\\/]/);
+          return parts[parts.length - 1].replace('.ts', '');
+        }).join(', ');
+        
         this.messages.push({
           role: 'user',
-          content: `[Toolsmith successfully created the ${isToolkit ? 'toolkit "' + toolkitName + '"' : 'tool "' + toolkitName + '"'}. The following tools are now ready to use: ${forgedPaths.map(p => join(isToolkit ? toolkitName : '', p.split(/[\\/]/).pop()!)).join(', ')}]`
+          content: `[Toolsmith successfully created the ${isToolkit ? 'toolkit "' + toolkitName + '"' : 'tool "' + toolkitName + '"'}. The following tools are now ready to use: ${toolNames}. You can now use these tools immediately in your workflow.]`
         });
+        
+        // Auto-continue the conversation so agent doesn't get stuck
+        console.log(chalk.gray('\n📋 Continuing agent workflow...\n'));
+        setTimeout(() => {
+          if (this.running && !this.toolQueueRunning) {
+            void this.sendMessage('');
+          }
+        }, 500);
       } else {
         displayError('Forge failed', 'No tools were successfully registered.');
+        
+        this.messages.push({
+          role: 'user',
+          content: `[Toolsmith failed to create "${toolkitName}". Continue with existing tools.]`
+        });
       }
       
     } catch (error: any) {
       spinner.stop();
       displayError('Forge failed', error.message);
-      this.messages.push({ role: 'user', content: `[Toolsmith failed: ${error.message}]` });
+      this.messages.push({ 
+        role: 'user', 
+        content: `[Toolsmith failed: ${error.message}. Continue with existing tools.]`
+      });
     }
+  }
+
+  // Helper method to extract code from markdown blocks
+  private extractCodeFromMarkdown(text: string): string {
+    // Try to extract TypeScript code block
+    const tsMatch = text.match(/```(?:typescript|ts)\n([\s\S]*?)```/) 
+                || text.match(/```\n([\s\S]*?)```/);
+    
+    if (tsMatch) {
+      return tsMatch[1].trim();
+    }
+    
+    // Fallback: try to find code by detecting import/export statements
+    const codeStart = text.search(/(import|export|const|function|async|class)\s/);
+    if (codeStart !== -1) {
+      let code = text.slice(codeStart);
+      
+      // Strip trailing markdown if any
+      const codeEnd = code.lastIndexOf('```');
+      if (codeEnd !== -1) {
+        code = code.slice(0, codeEnd);
+      }
+      
+      return code.trim();
+    }
+    
+    return text.trim();
   }
 
   async selectCustomModel(): Promise<void> {

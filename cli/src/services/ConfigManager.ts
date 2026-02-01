@@ -29,6 +29,10 @@ const rootEnvPath = join(__dirname, '..', '..', '..', '.env'); // services -> sr
 dotenv.config({ path: rootEnvPath });
 
 const DEFAULT_CONFIG = {
+  // LLM Provider settings (openrouter, copilot, ollama)
+  llm: {
+    provider: process.env.LLM_PROVIDER || 'openrouter'
+  },
   openrouter: {
     apiKey: process.env.OPENROUTER_API_KEY || '',
     model: process.env.OPENROUTER_MODEL || 'moonshotai/kimi-k2.5',
@@ -48,6 +52,12 @@ const DEFAULT_CONFIG = {
       summaryModel: '',
       summaryMaxTokens: 800
     }
+  },
+  // GitHub Copilot settings (for Pro/Pro+ subscribers)
+  copilot: {
+    model: process.env.COPILOT_MODEL || 'gpt-5',
+    temperature: 0.7,
+    maxTokens: 0
   },
   backend: {
     url: process.env.AGENTFORGE_BACKEND_URL || 'http://localhost:8000',

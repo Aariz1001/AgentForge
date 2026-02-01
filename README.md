@@ -2,7 +2,7 @@
 
 **A Truly Autonomous AI Agent System with Self-Evolving Architecture**
 
-AgentForge is an advanced TypeScript/Node.js CLI agent that goes beyond task execution. It can autonomously evolve its own architecture, generate dynamic tools, maintain persistent hierarchical memory across sessions, and execute sophisticated multi-agent workflows. Built on OpenRouter, it supports 300+ models with intelligent fallback strategies.
+AgentForge is an advanced TypeScript/Node.js CLI agent that goes beyond task execution. It can autonomously evolve its own architecture, generate dynamic tools, maintain persistent hierarchical memory across sessions, and execute sophisticated multi-agent workflows. Built on OpenRouter and GitHub Copilot, it supports 300+ models with intelligent fallback strategies.
 
 ## ✨ Core Features
 
@@ -11,6 +11,12 @@ AgentForge is an advanced TypeScript/Node.js CLI agent that goes beyond task exe
 - Plan-Act-Verify loops for complex tasks
 - Session persistence with cost tracking
 - Context-aware memory summaries across sessions
+
+**🔌 Multi-Provider LLM Support**
+- **OpenRouter**: Access 300+ models with pay-as-you-go pricing
+- **GitHub Copilot**: Use your Pro ($10/mo) or Pro+ ($39/mo) subscription
+- Seamless provider switching with `agentforge provider` command
+- Usage tracking for Copilot premium requests
 
 **🔧 Dynamic Tool Generation (ToolForge)**
 - Autonomously generates new tools from natural language descriptions
@@ -90,6 +96,34 @@ agentforge chat
 af chat
 ```
 
+### Provider Setup
+
+AgentForge supports multiple LLM providers. Choose based on your preference:
+
+**Option A: OpenRouter (Pay-as-you-go)**
+```bash
+# Set up your API key
+agentforge provider --login openrouter
+```
+
+**Option B: GitHub Copilot (Subscription-based)**
+```bash
+# Requires Copilot Pro ($10/mo) or Pro+ ($39/mo)
+# Also requires GitHub CLI: https://cli.github.com/
+
+# Authenticate and switch to Copilot
+agentforge provider --login copilot
+agentforge provider --switch copilot
+```
+
+**Check provider status:**
+```bash
+agentforge provider --list
+agentforge provider --usage  # View usage stats
+```
+
+See [docs/PROVIDERS.md](docs/PROVIDERS.md) for detailed provider configuration.
+
 ### Basic Usage
 
 **Globally installed:**
@@ -134,9 +168,10 @@ Start an interactive chat session with the AI agent.
 agentforge chat [options]
 
 Options:
-  -m, --model <model>   OpenRouter model ID
-  -s, --session <id>    Resume a previous session
-  --no-stream           Disable streaming responses
+  -m, --model <model>       Model ID to use
+  -s, --session <id>        Resume a previous session
+  -p, --provider <provider> LLM provider (openrouter, copilot)
+  --no-stream               Disable streaming responses
 ```
 
 **In-chat commands:**
@@ -146,6 +181,22 @@ Options:
 - `/forge <description>` - Generate a new tool
 - `/swarm <task>` - Run swarm mode (multi-agent planning + plan artifacts)
 - `/help` - Show help
+
+### `agentforge provider`
+
+Manage LLM providers (OpenRouter, GitHub Copilot).
+
+```bash
+agentforge provider [options]
+
+Options:
+  -l, --list              List all providers and their status
+  -s, --switch <provider> Switch to a provider (openrouter, copilot)
+  --login <provider>      Authenticate with a provider
+  --logout <provider>     Sign out from a provider
+  --models                List available models for active provider
+  --usage                 Show usage statistics for active provider
+```
 
 ### `agentforge tools`
 
@@ -163,7 +214,6 @@ Options:
 ### `agentforge forge`
 
 Generate new tools using ToolForge.
-
 ```bash
 agentforge forge [options]
 

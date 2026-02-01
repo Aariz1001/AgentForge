@@ -20,6 +20,7 @@ import { ForgeUI } from './components/ForgeUI';
 import { ComponentForge } from './components/ComponentForge';
 import { ConfigManager } from './services/ConfigManager';
 import { BackendClient } from './services/BackendClient';
+import { ProviderManager } from './services/ProviderManager';
 import { displayWelcome, displayHelp } from './utils/display';
 import { loadForgedTools } from './tools/index';
 
@@ -43,17 +44,43 @@ program
   .command('chat')
   .alias('c')
   .description('Start an interactive chat session with the agent')
-  .option('-m, --model <model>', 'OpenRouter model ID', 'anthropic/claude-3.5-sonnet')
+  .option('-m, --model <model>', 'Model ID to use')
   .option('-s, --session <id>', 'Resume a previous session')
+  .option('-p, --provider <provider>', 'LLM provider (openrouter, copilot)')
   .option('--no-stream', 'Disable streaming responses')
   .action(async (options) => {
     await coreToolsPromise;
     await displayWelcome();
     const config = new ConfigManager();
+    const providerManager = new ProviderManager(config);
     
-    if (!config.get('openrouter.apiKey')) {
-      console.log(chalk.yellow('\n⚠️  OpenRouter API key not configured.'));
-      await setupApiKey(config);
+    // Switch provider if specified
+    if (options.provider) {
+      const switched = await providerManager.setActiveProvider(options.provider as any);
+      if (!switched) {
+        console.log(chalk.yellow('\nFalling back to default provider...'));
+      }
+    }
+    
+    // Check if active provider is available
+    const activeProvider = providerManager.getActiveProvider();
+    const isAvailable = await activeProvider.isAvailable();
+    
+    if (!isAvailable) {
+      if (providerManager.getActiveProviderType() === 'openrouter') {
+        console.log(chalk.yellow('\n⚠️  OpenRouter API key not configured.'));
+        await setupApiKey(config);
+      } else if (providerManager.getActiveProviderType() === 'copilot') {
+        console.log(chalk.yellow('\n⚠️  GitHub Copilot not configured.'));
+        const authenticated = await providerManager.authenticateProvider('copilot');
+        if (!authenticated) {
+          console.log(chalk.yellow('\nFalling back to OpenRouter...'));
+          await providerManager.setActiveProvider('openrouter');
+          if (!config.get('openrouter.apiKey')) {
+            await setupApiKey(config);
+          }
+        }
+      }
     }
     
     const session = new ChatSession({
@@ -202,6 +229,77 @@ program
     }
   });
 
+// Provider command - manage LLM providers (OpenRouter, Copilot, etc.)
+program
+  .command('provider')
+  .alias('p')
+  .description('Manage LLM providers (OpenRouter, GitHub Copilot)')
+  .option('-l, --list', 'List all providers and their status')
+  .option('-s, --switch <provider>', 'Switch to a provider (openrouter, copilot)')
+  .option('--login <provider>', 'Authenticate with a provider')
+  .option('--logout <provider>', 'Sign out from a provider')
+  .option('--models', 'List available models for active provider')
+  .option('--usage', 'Show usage statistics for active provider')
+  .action(async (options) => {
+    const config = new ConfigManager();
+    const providerManager = new ProviderManager(config);
+    
+    if (options.login) {
+      const provider = options.login.toLowerCase();
+      if (provider === 'copilot') {
+        await providerManager.authenticateProvider('copilot');
+      } else if (provider === 'openrouter') {
+        // OpenRouter uses API key
+        await setupApiKey(config);
+      } else {
+        console.log(chalk.red(`Unknown provider: ${provider}`));
+        console.log(chalk.gray('Available providers: openrouter, copilot'));
+      }
+    } else if (options.logout) {
+      const provider = options.logout.toLowerCase();
+      await providerManager.signOutProvider(provider as any);
+    } else if (options.switch) {
+      const provider = options.switch.toLowerCase();
+      await providerManager.setActiveProvider(provider as any);
+    } else if (options.models) {
+      const spinner = ora('Fetching models...').start();
+      try {
+        const models = await providerManager.getModels();
+        spinner.stop();
+        console.log(chalk.bold(`\n🤖 Available Models (${providerManager.getActiveProviderType()})\n`));
+        models.slice(0, 30).forEach(m => console.log(`  ${chalk.cyan(m)}`));
+        if (models.length > 30) {
+          console.log(chalk.gray(`  ... and ${models.length - 30} more`));
+        }
+        console.log();
+      } catch (error: any) {
+        spinner.fail(error.message);
+      }
+    } else if (options.usage) {
+      const spinner = ora('Fetching usage...').start();
+      try {
+        const info = await providerManager.getInfo();
+        spinner.stop();
+        console.log(chalk.bold(`\n📊 ${info.displayName} Usage\n`));
+        if (info.subscription) {
+          console.log(`  Subscription: ${chalk.green(info.subscription)}`);
+        }
+        if (info.usage) {
+          const { used, limit, remaining } = info.usage;
+          const limitStr = limit === Infinity ? '∞' : limit.toString();
+          console.log(`  Requests Used: ${chalk.yellow(used)}/${limitStr}`);
+          console.log(`  Remaining: ${chalk.green(remaining)}`);
+        }
+        console.log();
+      } catch (error: any) {
+        spinner.fail(error.message);
+      }
+    } else {
+      // Default: show status
+      await providerManager.displayStatus();
+    }
+  });
+
 // Config command - manage settings
 program
   .command('config')
@@ -265,13 +363,16 @@ program
   .action(async () => {
     const config = new ConfigManager();
     const client = new BackendClient(config);
+    const providerManager = new ProviderManager(config);
     
     console.log(chalk.bold('\n📊 AgentForge Status\n'));
     
+    // Show provider status
+    await providerManager.displayStatus();
+    
     const checks = [
       { name: 'Backend API', check: () => client.healthCheck() },
-      { name: 'OpenRouter API', check: () => client.checkOpenRouter() },
-      { name: 'Configuration', check: () => !!config.get('openrouter.apiKey') }
+      { name: 'Configuration', check: () => !!config.get('openrouter.apiKey') || !!config.get('llm.provider') }
     ];
     
     for (const { name, check } of checks) {
@@ -387,14 +488,31 @@ function displayConfig(config: any) {
 program.action(async () => {
   await displayWelcome();
   const config = new ConfigManager();
+  const providerManager = new ProviderManager(config);
   
-  if (!config.get('openrouter.apiKey')) {
-    console.log(chalk.yellow('\n⚠️  OpenRouter API key not configured.'));
-    await setupApiKey(config);
+  // Check if active provider is available
+  const activeProvider = providerManager.getActiveProvider();
+  const isAvailable = await activeProvider.isAvailable();
+  
+  if (!isAvailable) {
+    if (providerManager.getActiveProviderType() === 'openrouter') {
+      console.log(chalk.yellow('\n⚠️  OpenRouter API key not configured.'));
+      await setupApiKey(config);
+    } else if (providerManager.getActiveProviderType() === 'copilot') {
+      console.log(chalk.yellow('\n⚠️  GitHub Copilot not configured.'));
+      const authenticated = await providerManager.authenticateProvider('copilot');
+      if (!authenticated) {
+        console.log(chalk.yellow('\nFalling back to OpenRouter...'));
+        await providerManager.setActiveProvider('openrouter');
+        if (!config.get('openrouter.apiKey')) {
+          await setupApiKey(config);
+        }
+      }
+    }
   }
   
   const session = new ChatSession({
-    model: config.get('openrouter.model') || 'anthropic/claude-3.5-sonnet',
+    model: config.get(`${providerManager.getActiveProviderType()}.model`),
     stream: true,
     config
   });

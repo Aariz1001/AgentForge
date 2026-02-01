@@ -2,12 +2,15 @@
  * Backend Client
  * ==============
  * HTTP client for communicating with the AgentForge Python backend.
+ * Also handles LLM routing to different providers (OpenRouter, Copilot).
  */
 
 import fetch from 'node-fetch';
 import EventSource from 'eventsource';
 import chalk from 'chalk';
 import { OpenRouter } from '@openrouter/sdk';
+import { CopilotService } from './CopilotService';
+import type { LLMMessage, LLMCompletionOptions } from './LLMProvider';
 
 export class BackendClient {
   private config: any;
@@ -15,13 +18,17 @@ export class BackendClient {
   private timeout: number;
   private apiKey: string | undefined;
   private orClient: any;
+  private copilotService: CopilotService | null = null;
 
   constructor(config: any) {
     this.config = config;
     this.baseUrl = config.get('backend.url') || 'http://localhost:8000';
     this.timeout = config.get('backend.timeout') ?? 60000;
     
-    // Use raw key and trim to ensure no whitespace issues
+    // Initialize provider based on config
+    const activeProvider = config.get('llm.provider') || 'openrouter';
+    
+    // Always initialize OpenRouter if key is available
     const rawKey = config.get('openrouter.apiKey');
     this.apiKey = rawKey ? String(rawKey).trim() : undefined;
     
@@ -249,8 +256,16 @@ export class BackendClient {
   
   /**
    * Direct OpenRouter call using SDK callModel pattern (non-streaming)
+   * If Copilot is the active provider, routes to Copilot instead
    */
   async openRouterComplete(messages: any[], options: any = {}): Promise<any> {
+    const activeProvider = this.config.get('llm.provider') || 'openrouter';
+    
+    // Route to Copilot if it's the active provider
+    if (activeProvider === 'copilot') {
+      return this.copilotComplete(messages, options);
+    }
+    
     if (!this.orClient) {
       throw new Error('OpenRouter client not initialized');
     }
@@ -339,8 +354,16 @@ export class BackendClient {
 
   /**
    * Stream OpenRouter completion using SDK callModel pattern
+   * If Copilot is the active provider, routes to Copilot instead
    */
   async streamOpenRouter(messages: any[], onChunk: (chunk: string) => void, options: any = {}): Promise<{ content: string, reasoning?: string, usage?: any }> {
+    const activeProvider = this.config.get('llm.provider') || 'openrouter';
+    
+    // Route to Copilot if it's the active provider
+    if (activeProvider === 'copilot') {
+      return this.copilotStream(messages, onChunk, options);
+    }
+    
     if (!this.orClient) {
       throw new Error('OpenRouter client not initialized');
     }
@@ -480,5 +503,88 @@ export class BackendClient {
        throw new Error(`Failed to fetch balance: ${error.message}`);
      }
    }
+
+  /**
+   * Get or create Copilot service instance
+   */
+  public getCopilotService(): CopilotService {
+    if (!this.copilotService) {
+      this.copilotService = new CopilotService(this.config);
+    }
+    return this.copilotService;
+  }
+
+  /**
+   * Copilot completion (non-streaming)
+   */
+  private async copilotComplete(messages: any[], options: any = {}): Promise<any> {
+    const copilot = this.getCopilotService();
+    
+    const model = options.model || this.config.get('copilot.model') || 'gpt-5';
+    
+    const llmMessages: LLMMessage[] = messages.map((m: any) => ({
+      role: m.role as 'system' | 'user' | 'assistant',
+      content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+    }));
+
+    try {
+      const response = await copilot.complete(llmMessages, {
+        model,
+        temperature: options.temperature,
+        maxTokens: options.maxTokens
+      });
+
+      // Return in OpenRouter-compatible format for ChatSession
+      return {
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: response.content,
+            reasoning: response.reasoning
+          }
+        }],
+        usage: response.usage,
+        provider: 'copilot',
+        model
+      };
+    } catch (error: any) {
+      throw new Error(`Copilot completion failed: ${error.message}`);
+    }
+  }
+
+  /**
+   * Copilot streaming
+   */
+  private async copilotStream(
+    messages: any[], 
+    onChunk: (chunk: string) => void, 
+    options: any = {}
+  ): Promise<{ content: string, reasoning?: string, usage?: any }> {
+    const copilot = this.getCopilotService();
+    
+    const model = options.model || this.config.get('copilot.model') || 'gpt-5';
+    
+    const llmMessages: LLMMessage[] = messages.map((m: any) => ({
+      role: m.role as 'system' | 'user' | 'assistant',
+      content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content)
+    }));
+
+    try {
+      return await copilot.stream(llmMessages, onChunk, {
+        model,
+        temperature: options.temperature,
+        maxTokens: options.maxTokens
+      });
+    } catch (error: any) {
+      throw new Error(`Copilot streaming failed: ${error.message}`);
+    }
+  }
+
+  /**
+   * Get active provider type
+   */
+  getActiveProvider(): string {
+    return this.config.get('llm.provider') || 'openrouter';
+  }
 }
 export default BackendClient;

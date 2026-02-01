@@ -445,8 +445,10 @@ Respond with ONLY a JSON array of tool specifications:
       }];
 
       const forgedPaths: string[] = [];
-      const forgingModel = 'moonshotai/kimi-k2.5';
-      const fallbackModel = this.config.get('openrouter.model') || 'anthropic/claude-3.5-sonnet';
+      
+      // Use the configured model from config instead of hardcoded values
+      const configuredModel = this.config.get('openrouter.model') || this.config.get('copilot.model');
+      const forgingModel = configuredModel || 'anthropic/claude-4.5-sonnet';
 
       for (const t of toolsToForge) {
         spinner.text = chalk.yellow(`Generating component: ${chalk.bold(t.name)}...`);
@@ -507,18 +509,10 @@ Generate a complete implementation. The main function should be exported as the 
               { role: 'user', content: userPrompt }
             ],
             () => {},
-            { temperature: 1.0, model: forgingModel, reasoning: true, include_reasoning: true }
+            { temperature: 1.0, model: forgingModel }
           );
         } catch (error: any) {
-          spinner.text = chalk.yellow(`Fallback forging for ${t.name}...`);
-          result = await this.client.streamOpenRouter(
-            [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: userPrompt }
-            ],
-            () => {},
-            { temperature: 0.2, model: fallbackModel }
-          );
+          throw new Error(`Tool generation failed: ${error.message}`);
         }
 
         let generatedCode = result.content;
