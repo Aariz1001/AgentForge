@@ -11,7 +11,7 @@ interface WindowSize {
 }
 
 interface BrowserControllerArgs {
-  action: 'launch' | 'close' | 'get_tabs' | 'switch_tab' | 'new_tab' | 'close_tab';
+  action: 'launch' | 'open' | 'start' | 'close' | 'quit' | 'exit' | 'get_tabs' | 'tabs' | 'list_tabs' | 'switch_tab' | 'new_tab' | 'close_tab';
   browserId?: string;
   headless?: boolean;
   profile?: string;
@@ -28,6 +28,7 @@ interface BrowserInstance {
   profile?: string;
   headless: boolean;
   userAgent?: string;
+  windowSize: WindowSize;
   createdAt: Date;
 }
 
@@ -40,6 +41,27 @@ interface TabInfo {
 const browserRegistry: Map<string, BrowserInstance> = new Map();
 
 let cleanupRegistered = false;
+
+async function normalizePageView(page: Page, windowSize: WindowSize): Promise<void> {
+  try {
+    await page.setViewport({
+      width: windowSize.width,
+      height: windowSize.height,
+      deviceScaleFactor: 1
+    });
+  } catch {
+    // Ignore viewport errors
+  }
+
+  try {
+    await page.evaluate(() => {
+      document.documentElement.style.zoom = '1';
+      document.body.style.zoom = '1';
+    });
+  } catch {
+    // Ignore zoom errors
+  }
+}
 
 function registerCleanup(): void {
   if (cleanupRegistered) return;
@@ -73,7 +95,11 @@ function registerCleanup(): void {
 
 export async function BrowserController(args: BrowserControllerArgs, options: any = {}): Promise<ToolResult> {
   try {
-    const action = args.action;
+    let action = args.action;
+
+    if (action === 'open' || action === 'start') action = 'launch';
+    if (action === 'quit' || action === 'exit') action = 'close';
+    if (action === 'tabs' || action === 'list_tabs') action = 'get_tabs';
 
     if (!action) {
       return new ToolResult(false, 'Action parameter is required');
@@ -130,12 +156,16 @@ async function launchBrowser(args: BrowserControllerArgs): Promise<ToolResult> {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-blink-features=AutomationControlled',
+        '--force-device-scale-factor=1',
+        '--high-dpi-support=1',
+        '--disable-features=UseZoomForDSF',
         `--window-size=${windowSize.width},${windowSize.height}`,
       ],
-      defaultViewport: {
+      defaultViewport: headless ? {
         width: windowSize.width,
         height: windowSize.height,
-      },
+        deviceScaleFactor: 1
+      } : null,
     };
 
     if (profile) {
@@ -154,6 +184,8 @@ async function launchBrowser(args: BrowserControllerArgs): Promise<ToolResult> {
       if (userAgent) {
         await pages[i].setUserAgent(userAgent);
       }
+
+      await normalizePageView(pages[i], windowSize);
     }
 
     const instance: BrowserInstance = {
@@ -163,6 +195,7 @@ async function launchBrowser(args: BrowserControllerArgs): Promise<ToolResult> {
       profile,
       headless,
       userAgent,
+      windowSize,
       createdAt: new Date(),
     };
 
@@ -332,6 +365,8 @@ async function newTab(args: BrowserControllerArgs): Promise<ToolResult> {
     if (instance.userAgent) {
       await page.setUserAgent(instance.userAgent);
     }
+
+    await normalizePageView(page, instance.windowSize);
     
     instance.pages.set(tabId, page);
 
@@ -415,9 +450,9 @@ async function closeTab(args: BrowserControllerArgs): Promise<ToolResult> {
 (BrowserController as any).parameters = {
   action: {
     type: "string",
-    description: "Action to perform: 'launch', 'close', 'get_tabs', 'switch_tab', 'new_tab', or 'close_tab'",
+    description: "Action to perform: 'launch' (aliases: open/start), 'close' (aliases: quit/exit), 'get_tabs' (aliases: tabs/list_tabs), 'switch_tab', 'new_tab', or 'close_tab'",
     required: true,
-    enum: ['launch', 'close', 'get_tabs', 'switch_tab', 'new_tab', 'close_tab']
+    enum: ['launch', 'open', 'start', 'close', 'quit', 'exit', 'get_tabs', 'tabs', 'list_tabs', 'switch_tab', 'new_tab', 'close_tab']
   },
   browserId: {
     type: "string",

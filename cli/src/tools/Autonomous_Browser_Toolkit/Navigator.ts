@@ -1,15 +1,17 @@
 import { ToolResult } from '../index';
-import type { Browser, Page, Response } from 'playwright';
-
-// Browser instance registry (managed by BrowserManager tool or similar)
-const browserInstances = new Map<string, Browser>();
+import type { Page, HTTPResponse } from 'puppeteer';
+import * as crypto from 'crypto';
+import { getBrowserRegistry } from './BrowserController';
 
 interface NavigatorArgs {
-  action: 'goto' | 'back' | 'forward' | 'refresh';
+  action: 'goto' | 'back' | 'forward' | 'refresh' | 'navigate' | 'open';
   browserId: string;
+  tabId?: string;
   url?: string;
   waitUntil?: 'load' | 'domcontentloaded' | 'networkidle';
   timeout?: number;
+  autoWait?: boolean;
+  autoWaitTimeout?: number;
 }
 
 interface NavigationData {
@@ -22,6 +24,10 @@ interface NavigationData {
   statusText: string | null;
   waitUntil: string;
   timeout: number;
+  autoWait: boolean;
+  autoWaitTimeout: number;
+  autoWaitStatus: 'completed' | 'skipped' | 'failed';
+  navigationWarning: string | null;
   navigationError: string | null;
   timestamp: string;
 }
@@ -35,7 +41,15 @@ interface ErrorData {
 }
 
 export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
-  const { action, browserId, url, waitUntil = 'load', timeout = 30000 } = args;
+  let { action, browserId, tabId, url, waitUntil = 'domcontentloaded', timeout = 15000, autoWait = true, autoWaitTimeout = 5000 } = args;
+
+  const clampTimeout = (value: number) => Math.min(Math.max(value, 3000), 45000);
+  timeout = clampTimeout(timeout);
+  autoWaitTimeout = clampTimeout(autoWaitTimeout);
+
+  if (action === 'navigate' || action === 'open') {
+    action = 'goto';
+  }
 
   // Validate required parameters
   if (!action) {
@@ -72,50 +86,66 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
   }
 
   try {
-    // Get browser instance from registry
-    const browser = browserInstances.get(browserId);
-    if (!browser) {
+    const registry = getBrowserRegistry();
+    const instance = registry.get(browserId);
+
+    if (!instance) {
       return new ToolResult(
         false,
-        `Browser instance '${browserId}' not found. Create a browser instance first using BrowserManager tool.`
+        `Browser instance '${browserId}' not found. Create a browser instance first using BrowserController tool.`
       );
     }
 
-    // Check if browser is still connected
-    if (!browser.isConnected()) {
+    if (!instance.browser.isConnected()) {
       return new ToolResult(
         false,
         `Browser instance '${browserId}' is disconnected. Please create a new browser instance.`
       );
     }
 
-    // Get the active page
-    const pages: Page[] = browser.contexts().flatMap(context => context.pages());
-    if (pages.length === 0) {
-      return new ToolResult(
-        false,
-        `No active pages found in browser instance '${browserId}'. Create a new page first.`
-      );
+    let page: Page | undefined;
+
+    if (tabId) {
+      page = instance.pages.get(tabId);
+      if (!page) {
+        return new ToolResult(
+          false,
+          `Tab with ID '${tabId}' not found in browser instance '${browserId}'.`
+        );
+      }
+    } else {
+      const firstOpen = Array.from(instance.pages.values()).find(p => !p.isClosed());
+      page = firstOpen;
     }
-    const page: Page = pages[0];
+
+    if (!page || page.isClosed()) {
+      const newPage = await instance.browser.newPage();
+      const newTabId = `tab-${crypto.randomBytes(4).toString('hex')}`;
+      instance.pages.set(newTabId, newPage);
+      page = newPage;
+      tabId = newTabId;
+    }
 
     const startTime = Date.now();
-    let response: Response | null = null;
+    let response: HTTPResponse | null = null;
     let navigationError: string | null = null;
+    let navigationWarning: string | null = null;
+
+    const puppeteerWaitUntil = waitUntil === 'networkidle' ? 'networkidle2' : waitUntil;
 
     // Perform navigation action
     try {
       switch (action) {
         case 'goto':
           response = await page.goto(url!, {
-            waitUntil: waitUntil as 'load' | 'domcontentloaded' | 'networkidle',
+            waitUntil: puppeteerWaitUntil as 'load' | 'domcontentloaded' | 'networkidle2',
             timeout: timeout
           });
           break;
 
         case 'back':
           response = await page.goBack({
-            waitUntil: waitUntil as 'load' | 'domcontentloaded' | 'networkidle',
+            waitUntil: puppeteerWaitUntil as 'load' | 'domcontentloaded' | 'networkidle2',
             timeout: timeout
           });
           if (response === null) {
@@ -125,7 +155,7 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
 
         case 'forward':
           response = await page.goForward({
-            waitUntil: waitUntil as 'load' | 'domcontentloaded' | 'networkidle',
+            waitUntil: puppeteerWaitUntil as 'load' | 'domcontentloaded' | 'networkidle2',
             timeout: timeout
           });
           if (response === null) {
@@ -135,7 +165,7 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
 
         case 'refresh':
           response = await page.reload({
-            waitUntil: waitUntil as 'load' | 'domcontentloaded' | 'networkidle',
+            waitUntil: puppeteerWaitUntil as 'load' | 'domcontentloaded' | 'networkidle2',
             timeout: timeout
           });
           break;
@@ -145,6 +175,30 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
     }
 
     const loadTime = Date.now() - startTime;
+
+    // Fallback when navigation timed out but page is usable
+    if (navigationError && /timeout/i.test(navigationError)) {
+      try {
+        const readyState = await page.evaluate(() => document.readyState);
+        if (readyState === 'interactive' || readyState === 'complete') {
+          navigationWarning = `Navigation timed out but document is ${readyState}.`;
+          navigationError = null;
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    // Optional auto-wait to let content settle
+    let autoWaitStatus: 'completed' | 'skipped' | 'failed' = 'skipped';
+    if (autoWait) {
+      try {
+        await page.waitForNetworkIdle({ timeout: autoWaitTimeout });
+        autoWaitStatus = 'completed';
+      } catch {
+        autoWaitStatus = 'failed';
+      }
+    }
 
     // Get final page information
     const finalUrl = page.url();
@@ -169,6 +223,10 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
       statusText,
       waitUntil,
       timeout,
+      autoWait,
+      autoWaitTimeout,
+      autoWaitStatus,
+      navigationWarning,
       navigationError,
       timestamp: new Date().toISOString()
     };
@@ -177,15 +235,18 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
       return new ToolResult(
         false,
         `Navigation ${action} failed: ${navigationError}`,
-        data
+        { ...data, tabId }
       );
     }
 
+    const warningSuffix = navigationWarning ? ` | Warning: ${navigationWarning}` : '';
     const summary = `Successfully navigated ${action === 'goto' ? `to ${url}` : action}. ` +
       `Final URL: ${finalUrl} | Title: "${pageTitle}" | Load time: ${loadTime}ms` +
-      (statusCode ? ` | Status: ${statusCode}` : '');
+      (statusCode ? ` | Status: ${statusCode}` : '') +
+      (tabId ? ` | Tab: ${tabId}` : '') +
+      warningSuffix;
 
-    return new ToolResult(true, summary, data);
+    return new ToolResult(true, summary, { ...data, tabId });
 
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -213,14 +274,19 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
 (Navigator as any).parameters = {
   action: {
     type: "string",
-    description: "Navigation action to perform: 'goto' (navigate to URL), 'back' (go back in history), 'forward' (go forward in history), 'refresh' (reload current page)",
+    description: "Navigation action: 'goto' (aliases: navigate/open), 'back', 'forward', 'refresh'",
     required: true,
-    enum: ['goto', 'back', 'forward', 'refresh']
+    enum: ['goto', 'navigate', 'open', 'back', 'forward', 'refresh']
   },
   browserId: {
     type: "string",
     description: "Unique identifier of the browser instance to perform navigation on",
     required: true
+  },
+  tabId: {
+    type: "string",
+    description: "Tab ID to navigate (optional; if omitted, the first available tab is used)",
+    required: false
   },
   url: {
     type: "string",
@@ -229,34 +295,29 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
   },
   waitUntil: {
     type: "string",
-    description: "When to consider navigation successful: 'load' (full page load including resources), 'domcontentloaded' (DOM is ready), 'networkidle' (no network activity for 500ms). Default: 'load'",
+    description: "When to consider navigation successful: 'load' (full page load including resources), 'domcontentloaded' (DOM is ready), 'networkidle' (no network activity for 500ms). Default: 'domcontentloaded'",
     required: false,
     enum: ['load', 'domcontentloaded', 'networkidle'],
-    default: 'load'
+    default: 'domcontentloaded'
   },
   timeout: {
     type: "number",
     description: "Maximum time in milliseconds to wait for navigation (0-300000). Default: 30000 (30 seconds)",
     required: false,
     default: 30000
+  },
+  autoWait: {
+    type: "boolean",
+    description: "After navigation, wait briefly for network to go idle (helps dynamic pages)",
+    required: false,
+    default: true
+  },
+  autoWaitTimeout: {
+    type: "number",
+    description: "Timeout in milliseconds for auto-wait network idle step",
+    required: false,
+    default: 5000
   }
 };
-
-// Browser instance registry management functions
-export function registerBrowserInstance(browserId: string, browser: Browser): void {
-  browserInstances.set(browserId, browser);
-}
-
-export function unregisterBrowserInstance(browserId: string): boolean {
-  return browserInstances.delete(browserId);
-}
-
-export function getBrowserInstance(browserId: string): Browser | undefined {
-  return browserInstances.get(browserId);
-}
-
-export function listBrowserInstances(): string[] {
-  return Array.from(browserInstances.keys());
-}
 
 export default Navigator;

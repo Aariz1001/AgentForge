@@ -17,13 +17,14 @@ const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 export async function search(query: string, options: any = {}): Promise<ToolResult> {
   const {
     maxResults = 5,
-    useBrave = false
+    useBrave = false,
+    autoBrave = true
   } = options;
 
   const braveKey = process.env.BRAVE_SEARCH_API_KEY;
 
-  // Use Brave if requested and key is available
-  if (useBrave && braveKey) {
+  // Use Brave if requested or autoBrave is enabled and key is available
+  if ((useBrave || autoBrave) && braveKey) {
     return await searchBrave(query, braveKey, maxResults);
   }
 
@@ -189,7 +190,8 @@ search.description = 'Unrestricted web search (DuckDuckGo/Brave) to find documen
 search.parameters = {
   query: { type: 'string', description: 'The search query', required: true },
   maxResults: { type: 'number', description: 'Number of results to return (max 10)', default: 5 },
-  useBrave: { type: 'boolean', description: 'Force Brave Search (requires BRAVE_SEARCH_API_KEY)', default: false }
+  useBrave: { type: 'boolean', description: 'Force Brave Search (requires BRAVE_SEARCH_API_KEY)', default: false },
+  autoBrave: { type: 'boolean', description: 'Automatically use Brave when API key is present (default: true)', default: true }
 };
 
 browse.description = 'Directly extract clean text content from any website URL.';

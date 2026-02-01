@@ -4,16 +4,17 @@ import chalk from 'chalk';
 interface VisionCaptureArgs {
   browserId: string;
   tabId?: string;
-  captureType: 'fullpage' | 'viewport' | 'element';
+  captureType: 'fullpage' | 'viewport' | 'element' | 'full' | 'view';
   selector?: string;
   format?: 'png' | 'jpeg';
   quality?: number;
   omitBackground?: boolean;
+  scroll?: { direction: 'up' | 'down' | 'top' | 'bottom'; amount?: number; delayMs?: number };
 }
 
 export async function VisionCapture(args: VisionCaptureArgs, options: any = {}): Promise<ToolResult> {
   try {
-    const { 
+    let { 
       browserId, 
       tabId, 
       captureType = 'viewport',
@@ -22,6 +23,9 @@ export async function VisionCapture(args: VisionCaptureArgs, options: any = {}):
       quality = 90,
       omitBackground = false
     } = args;
+
+    if (captureType === 'full') captureType = 'fullpage';
+    if (captureType === 'view') captureType = 'viewport';
 
     // Import dynamically to avoid circular dependencies
     const { getBrowserRegistry } = await import('./BrowserController');
@@ -32,12 +36,27 @@ export async function VisionCapture(args: VisionCaptureArgs, options: any = {}):
       return new ToolResult(false, `Browser instance ${browserId} not found`);
     }
 
-    const page = tabId ? instance.pages.get(tabId) : Array.from(instance.pages.values())[0];
-    if (!page) {
+    const page = tabId ? instance.pages.get(tabId) : Array.from(instance.pages.values()).find(p => !p.isClosed());
+    if (!page || page.isClosed()) {
       return new ToolResult(false, 'No active page found');
     }
 
-    let screenshot: Buffer;
+    if (args.scroll) {
+      const { direction, amount = 800, delayMs = 250 } = args.scroll;
+      if (direction === 'top') {
+        await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'auto' }));
+      } else if (direction === 'bottom') {
+        await page.evaluate(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'auto' }));
+      } else {
+        const dy = direction === 'up' ? -Math.abs(amount) : Math.abs(amount);
+        await page.evaluate((y) => window.scrollBy({ top: y, behavior: 'auto' }), dy);
+      }
+      if (delayMs > 0) {
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+
+    let screenshotBase64: string;
     let metadata: any = {
       url: page.url(),
       format,
@@ -47,12 +66,13 @@ export async function VisionCapture(args: VisionCaptureArgs, options: any = {}):
 
     switch (captureType) {
       case 'fullpage':
-        screenshot = await page.screenshot({
+        screenshotBase64 = await page.screenshot({
           fullPage: true,
           type: format,
           quality: format === 'jpeg' ? quality : undefined,
-          omitBackground
-        }) as Buffer;
+          omitBackground,
+          encoding: 'base64'
+        }) as string;
         
         const dimensions = await page.evaluate(() => ({
           width: document.documentElement.scrollWidth,
@@ -64,11 +84,12 @@ export async function VisionCapture(args: VisionCaptureArgs, options: any = {}):
         break;
 
       case 'viewport':
-        screenshot = await page.screenshot({
+        screenshotBase64 = await page.screenshot({
           type: format,
           quality: format === 'jpeg' ? quality : undefined,
-          omitBackground
-        }) as Buffer;
+          omitBackground,
+          encoding: 'base64'
+        }) as string;
         
         const viewport = page.viewport();
         metadata.width = viewport?.width || 1280;
@@ -91,11 +112,12 @@ export async function VisionCapture(args: VisionCaptureArgs, options: any = {}):
           return new ToolResult(false, `Element has no bounding box: ${selector}`);
         }
 
-        screenshot = await element.screenshot({
+        screenshotBase64 = await element.screenshot({
           type: format,
           quality: format === 'jpeg' ? quality : undefined,
-          omitBackground
-        }) as Buffer;
+          omitBackground,
+          encoding: 'base64'
+        }) as string;
 
         metadata.selector = selector;
         metadata.width = Math.round(boundingBox.width);
@@ -110,11 +132,10 @@ export async function VisionCapture(args: VisionCaptureArgs, options: any = {}):
     }
 
     // Convert to base64
-    const base64 = screenshot.toString('base64');
+    const base64 = screenshotBase64;
     const dataUrl = `data:image/${format};base64,${base64}`;
 
-    metadata.size = screenshot.length;
-    metadata.sizeKB = (screenshot.length / 1024).toFixed(2);
+    metadata.sizeKB = (base64.length / 1024).toFixed(2);
 
     return new ToolResult(true, `Screenshot captured: ${captureType} (${metadata.width}x${metadata.height}, ${metadata.sizeKB}KB)`, {
       screenshot: base64,
@@ -136,7 +157,17 @@ export async function VisionCapture(args: VisionCaptureArgs, options: any = {}):
   selector: { type: 'string', description: 'CSS selector for element capture type', required: false },
   format: { type: 'string', description: 'Image format: png or jpeg (default: png)', required: false },
   quality: { type: 'number', description: 'JPEG quality 0-100 (default: 90)', required: false },
-  omitBackground: { type: 'boolean', description: 'Omit white background for transparency (default: false)', required: false }
+  omitBackground: { type: 'boolean', description: 'Omit white background for transparency (default: false)', required: false },
+  scroll: {
+    type: 'object',
+    description: 'Optional scroll before capture',
+    required: false,
+    properties: {
+      direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] },
+      amount: { type: 'number', description: 'Scroll amount in pixels (default: 800)' },
+      delayMs: { type: 'number', description: 'Delay after scroll before capture (default: 250)' }
+    }
+  }
 };
 
 export default VisionCapture;

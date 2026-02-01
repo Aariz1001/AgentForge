@@ -216,6 +216,19 @@ export class ChatSession {
     }
   }
 
+  private supportsVision(): boolean {
+    // List of models known to support vision/multimodal inputs
+    const visionModels = [
+      'gpt-4', 'gpt-4-turbo', 'gpt-4o', 'gpt-4-vision',
+      'claude-3', 'claude-3.5', 'claude-3-opus', 'claude-3-sonnet', 'claude-3-haiku',
+      'gemini', 'gemini-pro-vision', 'gemini-1.5',
+      'llava', 'qwen-vl', 'pixtral'
+    ];
+    
+    const modelLower = this.model.toLowerCase();
+    return visionModels.some(vm => modelLower.includes(vm));
+  }
+
   private saveHistory(line: string): void {
     if (!line || line.trim() === '') return;
     try {
@@ -551,51 +564,41 @@ export class ChatSession {
   }
 
   private async readlineWithAutocomplete(commands: any[]): Promise<string> {
-    const result: any = await inquirer.prompt([
-      {
-        type: 'autocomplete',
-        name: 'userInput',
-        message: chalk.blue('▶'),
-        prefix: '',
-        pageSize: 15,
-        suggestOnly: true,
-        source: async (answers: any, input: string) => {
-          input = input || '';
-          const query = input.toLowerCase();
-          
-          // Command Completion - only shown when typing /
-          if (input.startsWith('/')) {
-            const matches = commands.filter(c => 
-              `/${c.name}`.toLowerCase().startsWith(query) || 
-              c.description.toLowerCase().includes(query)
-            );
+    return new Promise((resolve, reject) => {
+      let historyIndex = -1;
+      let tempInput = '';
+      
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+        terminal: true,
+        historySize: 100,
+        prompt: chalk.blue('▶ ')
+      });
 
-            return matches.map(c => ({
-              name: `${chalk.green('/' + c.name).padEnd(25)} ${chalk.gray(c.description)}`,
-              value: `/${c.name}`,
-              short: `/${c.name}`
-            }));
-          }
+      // Pre-populate history
+      const reverseHistory = [...this.history].reverse();
+      (rl as any).history = reverseHistory;
 
-          // Search History - only shown when typing and not a command
-          if (input.length > 1) {
-            const matches = this.history
-              .filter(h => h.toLowerCase().includes(query))
-              .reverse()
-              .slice(0, 5);
-            
-            return matches;
-          }
+      rl.prompt();
 
-          return [];
-        }
-      }
-    ]);
+      // Handle line submission
+      rl.on('line', (line: string) => {
+        rl.close();
+        resolve(line.trim());
+      });
 
-    // Clean up the box bottom after input
-    process.stdout.write(chalk.gray('└' + '─'.repeat(Math.max(0, (process.stdout.columns || 80) - 2)) + '┘\n'));
+      // Handle Ctrl+C
+      rl.on('SIGINT', () => {
+        rl.close();
+        resolve('');
+      });
 
-    return result.userInput;
+      // Handle errors
+      rl.on('close', () => {
+        // Already resolved in line handler
+      });
+    });
   }
 
   printInputBorder(position: 'top' | 'bottom'): void {
@@ -655,8 +658,10 @@ export class ChatSession {
           } else {
             const currentModel = this.model || this.config.get('openrouter.model');
             const provider = this.config.get('openrouter.provider') || 'default';
+            const visionSupport = this.supportsVision();
             console.log(`Current model: ${chalk.cyan(currentModel)}`);
             console.log(`Provider: ${chalk.cyan(provider)}`);
+            console.log(`Vision support: ${visionSupport ? chalk.green('✓ Yes') : chalk.yellow('✗ No')}`);
             console.log(chalk.gray('Use /model <model_id> to change, or /model custom for provider selection'));
           }
           break;
@@ -1518,6 +1523,13 @@ export class ChatSession {
     const target = args?.filePath || args?.path || args?.command || args?.pattern || '';
     let detail = '';
 
+    if (name.startsWith('Autonomous_Browser_Toolkit_')) {
+      const action = args?.action ? `action: ${args.action}` : '';
+      const browserId = args?.browserId ? `browser: ${args.browserId}` : '';
+      const tabId = args?.tabId ? `tab: ${args.tabId}` : '';
+      const url = args?.url ? `url: ${args.url}` : '';
+      detail = [action, browserId, tabId, url].filter(Boolean).join(' | ') || result?.summary || 'done';
+    } else {
     switch (name) {
       case 'grep':
         detail = `matches: ${data.matches ?? 0}`;
@@ -1544,6 +1556,7 @@ export class ChatSession {
       default:
         detail = result?.summary || result?.toString?.() || 'done';
         break;
+    }
     }
 
     const targetText = target ? chalk.gray(target) : chalk.gray('n/a');
@@ -1821,15 +1834,15 @@ export class ChatSession {
   
   async sendMessage(content: string): Promise<void> {
     if (content) {
-      // Create message with current multimodal state using latest OpenRouter SDK callModel format
+      // Create message with current multimodal state using standard OpenAI format
       const userMsg: any = {
         role: 'user',
         content: this.pendingImage 
           ? [
-              { type: 'input_text', text: content },
+              { type: 'text', text: content },
               { 
-                type: 'input_image', 
-                imageUrl: this.pendingImage
+                type: 'image_url', 
+                image_url: { url: this.pendingImage }
               }
             ]
           : content
@@ -2346,19 +2359,29 @@ export class ChatSession {
           }
         }
         
-        // Multi-modal message construction using latest OpenRouter SDK callModel format
+        // Multi-modal message construction with vision capability detection
         if (result.data && result.data.screenshot) {
           const imageUrl = `data:image/png;base64,${result.data.screenshot}`;
-          this.messages.push({
-            role: 'user',
-            content: [
-              { type: 'input_text', text: textContent },
-              { 
-                type: 'input_image', 
-                imageUrl: imageUrl
-              }
-            ]
-          } as any);
+          
+          if (this.supportsVision()) {
+            // Model supports vision - attach image
+            this.messages.push({
+              role: 'user',
+              content: [
+                { type: 'text', text: textContent },
+                { 
+                  type: 'image_url', 
+                  image_url: { url: imageUrl }
+                }
+              ]
+            } as any);
+          } else {
+            // Model doesn't support vision - text only with note
+            this.messages.push({
+              role: 'user',
+              content: textContent + '\n\n[Note: Screenshot captured but current model does not support vision. Consider switching to a vision-capable model like gpt-4o, claude-3.5-sonnet, or gemini-1.5-pro to analyze images.]'
+            });
+          }
         } else {
           this.messages.push({
             role: 'user',

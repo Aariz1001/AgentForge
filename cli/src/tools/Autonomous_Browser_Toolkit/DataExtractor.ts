@@ -1,4 +1,5 @@
 import { ToolResult } from '../index';
+import { getBrowserRegistry } from './BrowserController';
 import chalk from 'chalk';
 
 interface StructureField {
@@ -8,8 +9,9 @@ interface StructureField {
 }
 
 interface DataExtractorArgs {
-  action: 'get_text' | 'get_attribute' | 'get_html' | 'get_all' | 'extract_table' | 'extract_links' | 'extract_structured';
+  action: 'get_text' | 'get_attribute' | 'get_html' | 'get_all' | 'extract_table' | 'extract_links' | 'extract_structured' | 'extract_content' | 'extract_text' | 'text' | 'html' | 'attrs' | 'attribute' | 'links' | 'table';
   browserId: string;
+  tabId?: string;
   selector?: string;
   xpath?: string;
   attribute?: string;
@@ -19,7 +21,13 @@ interface DataExtractorArgs {
 
 export async function DataExtractor(args: DataExtractorArgs): Promise<ToolResult> {
   try {
-    const { action, browserId, selector, xpath, attribute, multiple = false, structure } = args;
+    let { action, browserId, tabId, selector, xpath, attribute, multiple = false, structure } = args;
+
+    if (action === 'extract_text' || action === 'text') action = 'get_text';
+    if (action === 'html') action = 'get_html';
+    if (action === 'attrs' || action === 'attribute') action = 'get_attribute';
+    if (action === 'links') action = 'extract_links';
+    if (action === 'table') action = 'extract_table';
 
     if (!action) {
       return new ToolResult(false, 'Missing required parameter: action');
@@ -28,14 +36,22 @@ export async function DataExtractor(args: DataExtractorArgs): Promise<ToolResult
       return new ToolResult(false, 'Missing required parameter: browserId');
     }
 
-    const browserRegistry = (global as any).__BROWSER_REGISTRY__ || {};
-    const browserInstance = browserRegistry[browserId];
+    const registry = getBrowserRegistry();
+    const instance = registry.get(browserId);
 
-    if (!browserInstance || !browserInstance.page) {
-      return new ToolResult(false, `Browser with ID "${browserId}" not found or has no active page`);
+    if (!instance) {
+      return new ToolResult(false, `Browser with ID "${browserId}" not found. Create a browser instance first using BrowserController tool.`);
     }
 
-    const page = browserInstance.page;
+    let page = tabId ? instance.pages.get(tabId) : undefined;
+
+    if (!page) {
+      page = Array.from(instance.pages.values()).find(p => !p.isClosed());
+    }
+
+    if (!page || page.isClosed()) {
+      return new ToolResult(false, `Browser with ID "${browserId}" not found or has no active page`);
+    }
     let extractedData: any = null;
     let elementCount = 0;
     const qualityMetrics: any = {
@@ -46,7 +62,7 @@ export async function DataExtractor(args: DataExtractorArgs): Promise<ToolResult
     };
 
     const useSelector = selector || xpath;
-    if (!useSelector && action !== 'extract_links' && action !== 'extract_structured') {
+    if (!useSelector && action !== 'extract_links' && action !== 'extract_structured' && action !== 'extract_content') {
       return new ToolResult(false, 'Either selector or xpath is required for this action');
     }
 
@@ -89,6 +105,17 @@ export async function DataExtractor(args: DataExtractorArgs): Promise<ToolResult
         }
         qualityMetrics.totalElements = elementCount;
         break;
+
+      case 'extract_content': {
+        extractedData = await page.evaluate(() => {
+          const main = document.querySelector('main') || document.querySelector('article') || document.body;
+          return main?.innerText?.trim() || '';
+        });
+        elementCount = extractedData ? 1 : 0;
+        qualityMetrics.totalElements = elementCount;
+        qualityMetrics.emptyResults = extractedData ? 0 : 1;
+        break;
+      }
 
       case 'get_attribute':
         if (!attribute) {
@@ -340,14 +367,19 @@ export async function DataExtractor(args: DataExtractorArgs): Promise<ToolResult
 (DataExtractor as any).parameters = {
   action: {
     type: "string",
-    description: "Extraction action to perform: 'get_text' (extract text content), 'get_attribute' (extract attribute values), 'get_html' (extract HTML), 'get_all' (extract all element data), 'extract_table' (extract table data), 'extract_links' (extract links), 'extract_structured' (extract structured data using custom schema)",
+    description: "Extraction action: get_text (aliases: extract_text/text), get_attribute (aliases: attribute/attrs), get_html (alias: html), get_all, extract_table (alias: table), extract_links (alias: links), extract_structured, extract_content",
     required: true,
-    enum: ['get_text', 'get_attribute', 'get_html', 'get_all', 'extract_table', 'extract_links', 'extract_structured']
+    enum: ['get_text', 'get_attribute', 'get_html', 'get_all', 'extract_table', 'extract_links', 'extract_structured', 'extract_content']
   },
   browserId: {
     type: "string",
     description: "Unique identifier of the browser instance to extract data from",
     required: true
+  },
+  tabId: {
+    type: "string",
+    description: "Tab ID to extract from (optional; defaults to first available tab)",
+    required: false
   },
   selector: {
     type: "string",

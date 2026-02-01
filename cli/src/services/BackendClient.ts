@@ -47,6 +47,43 @@ export class BackendClient {
   }
 
   private headers: Record<string, string> = {};
+
+  private hasMultimodalContent(messages: any[]): boolean {
+    return messages.some(m => Array.isArray(m.content) && m.content.some((p: any) => p?.type && p.type !== 'text'));
+  }
+
+  private async openRouterChatRawComplete(messages: any[], options: any = {}): Promise<any> {
+    if (!this.apiKey) {
+      throw new Error('OpenRouter API key not configured');
+    }
+
+    const model = options.model || this.config.get('openrouter.model');
+    const configuredMaxTokens = options.maxTokens ?? this.config.get('openrouter.maxTokens');
+    const max_tokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
+      ? configuredMaxTokens
+      : undefined;
+
+    const body: any = {
+      model,
+      messages,
+      temperature: options.temperature ?? this.config.get('openrouter.temperature') ?? 0.7,
+      stream: false,
+      ...(max_tokens ? { max_tokens } : {})
+    };
+
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: this.headers,
+      body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => '');
+      throw new Error(`OpenRouter chat completion failed: ${response.status} ${errorBody}`);
+    }
+
+    return await response.json();
+  }
   
   /**
    * Make an HTTP request to the backend
@@ -255,7 +292,7 @@ export class BackendClient {
   }
   
   /**
-   * Direct OpenRouter call using SDK callModel pattern (non-streaming)
+   * Direct OpenRouter call using SDK chat.send (non-streaming)
    * If Copilot is the active provider, routes to Copilot instead
    */
   async openRouterComplete(messages: any[], options: any = {}): Promise<any> {
@@ -270,75 +307,37 @@ export class BackendClient {
       throw new Error('OpenRouter client not initialized');
     }
 
+    if (this.hasMultimodalContent(messages)) {
+      return await this.openRouterChatRawComplete(messages, options);
+    }
+
     const model = options.model || this.config.get('openrouter.model');
     const configuredMaxTokens = options.maxTokens ?? this.config.get('openrouter.maxTokens');
-    const maxOutputTokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
+    const maxTokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
       ? configuredMaxTokens
       : undefined;
 
-    // Separate system message if it's the first one to use the instructions parameter
-    let instructions: string | undefined;
-    let input: any[] = messages;
-
-    if (messages.length > 0 && messages[0].role === 'system') {
-      instructions = String(messages[0].content);
-      input = messages.slice(1);
-    }
-    
     const send = async (withReasoning: boolean) => {
-      const callArgs: any = {
+      const requestBody: any = {
         model,
-        input,
+        messages,
         temperature: options.temperature ?? this.config.get('openrouter.temperature') ?? 0.7,
-        ...(maxOutputTokens ? { maxOutputTokens } : {}),
+        ...(maxTokens ? { maxTokens } : {}),
         ...(withReasoning && options.reasoning ? { reasoning: options.reasoning } : {})
       };
-      
-      if (instructions) {
-        callArgs.instructions = instructions;
-      }
 
-      const result = this.orClient.callModel(callArgs);
-      return await result.getResponse();
+      return await this.orClient.chat.send(requestBody);
     };
 
     try {
       const response = await send(true);
       
-      // Normalize response to maintain compatibility with existing ChatSession logic
-      // existing logic expects response.choices[0].message.content
-      // or similar from openRouter
-      if (response && response.text && !response.choices) {
-        return {
-          ...response,
-          choices: [{
-            message: {
-              role: 'assistant',
-              content: response.text,
-              reasoning: response.reasoning
-            }
-          }],
-          usage: response.usage
-        };
-      }
       return response;
     } catch (error: any) {
       const message = error?.message || '';
       if (options.reasoning && /reasoning|unknown parameter|unsupported|invalid/i.test(message)) {
         try {
           const fallback = await send(false);
-          if (fallback && fallback.text && !fallback.choices) {
-             return {
-              ...fallback,
-              choices: [{
-                message: {
-                  role: 'assistant',
-                  content: fallback.text
-                }
-              }],
-              usage: fallback.usage
-            };
-          }
           return fallback;
         } catch (inner: any) {
           error = inner;
@@ -353,7 +352,7 @@ export class BackendClient {
   }
 
   /**
-   * Stream OpenRouter completion using SDK callModel pattern
+   * Stream OpenRouter completion using SDK chat.send
    * If Copilot is the active provider, routes to Copilot instead
    */
   async streamOpenRouter(messages: any[], onChunk: (chunk: string) => void, options: any = {}): Promise<{ content: string, reasoning?: string, usage?: any }> {
@@ -368,76 +367,74 @@ export class BackendClient {
       throw new Error('OpenRouter client not initialized');
     }
 
+    if (this.hasMultimodalContent(messages)) {
+      const response = await this.openRouterChatRawComplete(messages, options);
+      const content = response?.choices?.[0]?.message?.content || '';
+      if (content) {
+        onChunk(content);
+      }
+      return { content, usage: response?.usage };
+    }
+
     const model = options.model || this.config.get('openrouter.model');
     const configuredMaxTokens = options.maxTokens ?? this.config.get('openrouter.maxTokens');
-    const maxOutputTokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
+    const maxTokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
       ? configuredMaxTokens
       : undefined;
 
-    let instructions: string | undefined;
-    let input: any[] = messages;
-
-    if (messages.length > 0 && messages[0].role === 'system') {
-      instructions = String(messages[0].content);
-      input = messages.slice(1);
-    }
-    
     const getStream = (withReasoning: boolean) => {
-      const callArgs: any = {
+      const requestBody: any = {
         model,
-        input,
+        messages,
         temperature: options.temperature ?? 0.7,
-        ...(maxOutputTokens ? { maxOutputTokens } : {}),
+        stream: true,
+        ...(maxTokens ? { maxTokens } : {}),
         ...(withReasoning && options.reasoning ? { 
           reasoning: typeof options.reasoning === 'object' ? options.reasoning : { enabled: true }
         } : {})
       };
 
-      if (instructions) {
-        callArgs.instructions = instructions;
-      }
-
-      return this.orClient.callModel(callArgs);
+      return this.orClient.chat.send(requestBody);
     };
 
     try {
-      const result = getStream(true);
+      const result = await getStream(true);
 
       let fullContent = '';
       let fullReasoning = '';
+      let lastUsage: any = undefined;
 
-      for await (const delta of result.getTextStream()) {
-        fullContent += delta;
-        onChunk(delta);
-      }
-
-      // Check for reasoning if supported
-      try {
-        for await (const reason of result.getReasoningStream()) {
-          fullReasoning += reason;
-          if (options.includeReasoningInContent) {
-            fullContent += reason;
-            onChunk(reason);
-          }
+      for await (const chunkData of result) {
+        const delta = chunkData.choices?.[0]?.delta?.content || '';
+        if (delta) {
+          fullContent += delta;
+          onChunk(delta);
         }
-      } catch (e) {
-        // Reasoning stream might not be supported/available
+
+        if (chunkData.usage) {
+          lastUsage = chunkData.usage;
+        }
       }
 
-      const response = await result.getResponse();
-      return { content: fullContent, reasoning: fullReasoning, usage: response.usage };
+      return { content: fullContent, reasoning: fullReasoning || undefined, usage: lastUsage };
     } catch (error: any) {
       const message = error?.message || '';
       if (options.reasoning && /reasoning|unknown parameter|unsupported|invalid/i.test(message)) {
         try {
-          const result = getStream(false);
+          const result = await getStream(false);
           let fullContent = '';
-          for await (const delta of result.getTextStream()) {
-            fullContent += delta;
-            onChunk(delta);
+          let lastUsage: any = undefined;
+          for await (const chunkData of result) {
+            const delta = chunkData.choices?.[0]?.delta?.content || '';
+            if (delta) {
+              fullContent += delta;
+              onChunk(delta);
+            }
+            if (chunkData.usage) {
+              lastUsage = chunkData.usage;
+            }
           }
-          const response = await result.getResponse();
-          return { content: fullContent, usage: response.usage };
+          return { content: fullContent, usage: lastUsage };
         } catch (inner: any) {
           error = inner;
         }

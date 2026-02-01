@@ -4,7 +4,7 @@ import chalk from 'chalk';
 interface WaitStrategyArgs {
   browserId: string;
   tabId?: string;
-  strategy: 'element' | 'navigation' | 'network_idle' | 'timeout' | 'function';
+  strategy: 'element' | 'navigation' | 'network_idle' | 'timeout' | 'function' | 'auto' | 'network' | 'networkidle' | 'nav' | 'navigate';
   selector?: string;
   timeout?: number;
   waitFunction?: string;
@@ -14,16 +14,22 @@ interface WaitStrategyArgs {
 
 export async function WaitStrategy(args: WaitStrategyArgs, options: any = {}): Promise<ToolResult> {
   try {
-    const { 
+    let { 
       browserId, 
       tabId, 
       strategy, 
       selector, 
-      timeout = 30000,
+      timeout = 15000,
       waitFunction,
       pollInterval = 100,
       state = 'visible'
     } = args;
+
+    if (strategy === 'networkidle' || strategy === 'network') strategy = 'network_idle';
+    if (strategy === 'nav' || strategy === 'navigate') strategy = 'navigation';
+
+    const clampTimeout = (value: number) => Math.min(Math.max(value, 3000), 45000);
+    const effectiveTimeout = clampTimeout(timeout);
 
     // Import dynamically to avoid circular dependencies
     const { getBrowserRegistry } = await import('./BrowserController');
@@ -34,8 +40,8 @@ export async function WaitStrategy(args: WaitStrategyArgs, options: any = {}): P
       return new ToolResult(false, `Browser instance ${browserId} not found`);
     }
 
-    const page = tabId ? instance.pages.get(tabId) : Array.from(instance.pages.values())[0];
-    if (!page) {
+    const page = tabId ? instance.pages.get(tabId) : Array.from(instance.pages.values()).find(p => !p.isClosed());
+    if (!page || page.isClosed()) {
       return new ToolResult(false, 'No active page found');
     }
 
@@ -47,11 +53,17 @@ export async function WaitStrategy(args: WaitStrategyArgs, options: any = {}): P
           return new ToolResult(false, 'selector is required for element wait strategy');
         }
 
-        await page.waitForSelector(selector, { 
-          timeout,
-          visible: state === 'visible',
-          hidden: state === 'hidden'
-        });
+        if (state === 'attached') {
+          await page.waitForSelector(selector, { timeout: effectiveTimeout });
+        } else if (state === 'detached') {
+          await page.waitForSelector(selector, { timeout: effectiveTimeout, hidden: true });
+        } else {
+          await page.waitForSelector(selector, { 
+            timeout: effectiveTimeout,
+            visible: state === 'visible',
+            hidden: state === 'hidden'
+          });
+        }
 
         const elapsed = Date.now() - startTime;
         return new ToolResult(true, `Element "${selector}" became ${state}`, {
@@ -63,7 +75,7 @@ export async function WaitStrategy(args: WaitStrategyArgs, options: any = {}): P
       }
 
       case 'navigation': {
-        await page.waitForNavigation({ timeout, waitUntil: 'networkidle2' });
+        await page.waitForNavigation({ timeout: effectiveTimeout, waitUntil: 'domcontentloaded' });
         const elapsed = Date.now() - startTime;
         return new ToolResult(true, 'Navigation completed', {
           url: page.url(),
@@ -73,7 +85,7 @@ export async function WaitStrategy(args: WaitStrategyArgs, options: any = {}): P
       }
 
       case 'network_idle': {
-        await page.waitForNetworkIdle({ timeout });
+        await page.waitForNetworkIdle({ timeout: effectiveTimeout });
         const elapsed = Date.now() - startTime;
         return new ToolResult(true, 'Network became idle', {
           url: page.url(),
@@ -82,9 +94,9 @@ export async function WaitStrategy(args: WaitStrategyArgs, options: any = {}): P
       }
 
       case 'timeout': {
-        await new Promise(resolve => setTimeout(resolve, timeout));
-        return new ToolResult(true, `Waited for ${timeout}ms`, {
-          timeoutMs: timeout
+        await new Promise(resolve => setTimeout(resolve, effectiveTimeout));
+        return new ToolResult(true, `Waited for ${effectiveTimeout}ms`, {
+          timeoutMs: effectiveTimeout
         });
       }
 
@@ -93,7 +105,7 @@ export async function WaitStrategy(args: WaitStrategyArgs, options: any = {}): P
           return new ToolResult(false, 'waitFunction is required for function wait strategy');
         }
 
-        await page.waitForFunction(waitFunction, { timeout, polling: pollInterval });
+        await page.waitForFunction(waitFunction, { timeout: effectiveTimeout, polling: pollInterval });
         const elapsed = Date.now() - startTime;
         return new ToolResult(true, 'Custom wait condition met', {
           function: waitFunction,
@@ -102,15 +114,65 @@ export async function WaitStrategy(args: WaitStrategyArgs, options: any = {}): P
         });
       }
 
+      case 'auto': {
+        const steps: string[] = [];
+        const endBy = Date.now() + effectiveTimeout;
+
+        const remaining = () => Math.max(500, endBy - Date.now());
+
+        try {
+          await page.waitForFunction(() => document.readyState !== 'loading', { timeout: Math.min(5000, remaining()) });
+          steps.push('dom_ready');
+        } catch {
+          // ignore
+        }
+
+        const selectors = selector ? [selector] : ['main', '[role="main"]', 'article', 'body'];
+        let matchedSelector: string | null = null;
+        for (const sel of selectors) {
+          try {
+            await page.waitForSelector(sel, { timeout: Math.min(3000, remaining()), visible: sel !== 'body' });
+            matchedSelector = sel;
+            steps.push(`element:${sel}`);
+            break;
+          } catch {
+            // try next
+          }
+        }
+
+        try {
+          await page.waitForNetworkIdle({ timeout: Math.min(5000, remaining()) });
+          steps.push('network_idle');
+        } catch {
+          // ignore
+        }
+
+        const elapsed = Date.now() - startTime;
+        if (steps.length === 0) {
+          return new ToolResult(false, 'Auto wait did not detect readiness signals', {
+            elapsedMs: elapsed,
+            url: page.url(),
+          });
+        }
+
+        return new ToolResult(true, 'Auto wait completed', {
+          steps,
+          matchedSelector,
+          elapsedMs: elapsed,
+          url: page.url(),
+        });
+      }
+
       default:
         return new ToolResult(false, `Unknown strategy: ${strategy}`);
     }
 
   } catch (error: any) {
+    const fallbackTimeout = Math.min(Math.max(args.timeout ?? 15000, 3000), 45000);
     if (error.message.includes('timeout') || error.message.includes('Timeout')) {
       return new ToolResult(false, `Wait timeout exceeded: ${error.message}`, {
         strategy: args.strategy,
-        timeout: args.timeout
+        timeout: fallbackTimeout
       });
     }
     return new ToolResult(false, `Wait strategy failed: ${error.message}`);
@@ -118,11 +180,11 @@ export async function WaitStrategy(args: WaitStrategyArgs, options: any = {}): P
 }
 
 // Metadata
-(WaitStrategy as any).description = "Intelligent waiting strategies for dynamic content including waiting for elements to appear/disappear, network idle state, page navigation, custom JavaScript conditions, or simple time-based delays";
+(WaitStrategy as any).description = "Intelligent waiting strategies for dynamic content including auto readiness detection, waiting for elements to appear/disappear, network idle state, page navigation, custom JavaScript conditions, or simple time-based delays";
 (WaitStrategy as any).parameters = {
   browserId: { type: 'string', description: 'Browser instance ID', required: true },
   tabId: { type: 'string', description: 'Tab ID (optional, uses first tab if not specified)', required: false },
-  strategy: { type: 'string', description: 'Wait strategy: element, navigation, network_idle, timeout, or function', required: true },
+  strategy: { type: 'string', description: 'Wait strategy: auto, element, navigation (alias: nav/navigate), network_idle (alias: network/networkidle), timeout, or function', required: true },
   selector: { type: 'string', description: 'CSS selector for element strategy', required: false },
   timeout: { type: 'number', description: 'Maximum wait time in milliseconds (default: 30000)', required: false },
   waitFunction: { type: 'string', description: 'JavaScript function code for function strategy (should return boolean)', required: false },

@@ -11,11 +11,12 @@ interface SessionManagerArgs {
   key?: string;
   value?: string;
   sessionData?: any;
+  maxItems?: number;
 }
 
 export async function SessionManager(args: SessionManagerArgs, options: any = {}): Promise<ToolResult> {
   try {
-    const { browserId, tabId, action, cookies, storageType = 'localStorage', storageData, key, value, sessionData } = args;
+    const { browserId, tabId, action, cookies, storageType = 'localStorage', storageData, key, value, sessionData, maxItems = 200 } = args;
 
     // Import dynamically to avoid circular dependencies
     const { getBrowserRegistry } = await import('./BrowserController');
@@ -26,8 +27,8 @@ export async function SessionManager(args: SessionManagerArgs, options: any = {}
       return new ToolResult(false, `Browser instance ${browserId} not found`);
     }
 
-    const page = tabId ? instance.pages.get(tabId) : Array.from(instance.pages.values())[0];
-    if (!page) {
+    const page = tabId ? instance.pages.get(tabId) : Array.from(instance.pages.values()).find(p => !p.isClosed());
+    if (!page || page.isClosed()) {
       return new ToolResult(false, 'No active page found');
     }
 
@@ -52,17 +53,17 @@ export async function SessionManager(args: SessionManagerArgs, options: any = {}
       }
 
       case 'get_storage': {
-        const storage = await page.evaluate((type) => {
+        const storage = await page.evaluate((type, limit) => {
           const store = type === 'localStorage' ? window.localStorage : window.sessionStorage;
           const data: Record<string, string> = {};
-          for (let i = 0; i < store.length; i++) {
+          for (let i = 0; i < store.length && i < limit; i++) {
             const key = store.key(i);
             if (key) {
               data[key] = store.getItem(key) || '';
             }
           }
           return data;
-        }, storageType);
+        }, storageType, maxItems);
 
         return new ToolResult(true, `Retrieved ${Object.keys(storage).length} ${storageType} item(s)`, { 
           storageType,
@@ -103,26 +104,26 @@ export async function SessionManager(args: SessionManagerArgs, options: any = {}
 
       case 'export_session': {
         const pageCookies = await page.cookies();
-        const localStorage = await page.evaluate(() => {
+        const localStorage = await page.evaluate((limit) => {
           const data: Record<string, string> = {};
-          for (let i = 0; i < window.localStorage.length; i++) {
+          for (let i = 0; i < window.localStorage.length && i < limit; i++) {
             const key = window.localStorage.key(i);
             if (key) {
               data[key] = window.localStorage.getItem(key) || '';
             }
           }
           return data;
-        });
-        const sessionStorage = await page.evaluate(() => {
+        }, maxItems);
+        const sessionStorage = await page.evaluate((limit) => {
           const data: Record<string, string> = {};
-          for (let i = 0; i < window.sessionStorage.length; i++) {
+          for (let i = 0; i < window.sessionStorage.length && i < limit; i++) {
             const key = window.sessionStorage.key(i);
             if (key) {
               data[key] = window.sessionStorage.getItem(key) || '';
             }
           }
           return data;
-        });
+        }, maxItems);
 
         const exportData = {
           url: page.url(),
@@ -132,7 +133,7 @@ export async function SessionManager(args: SessionManagerArgs, options: any = {}
           exportedAt: new Date().toISOString()
         };
 
-        return new ToolResult(true, 'Session exported successfully', { session: exportData });
+        return new ToolResult(true, 'Session exported successfully', { session: exportData, maxItems });
       }
 
       case 'import_session': {
@@ -190,7 +191,8 @@ export async function SessionManager(args: SessionManagerArgs, options: any = {}
   storageData: { type: 'object', description: 'Key-value pairs for set_storage action', required: false },
   key: { type: 'string', description: 'Storage key for set_storage action', required: false },
   value: { type: 'string', description: 'Storage value for set_storage action', required: false },
-  sessionData: { type: 'object', description: 'Complete session data for import_session action', required: false }
+  sessionData: { type: 'object', description: 'Complete session data for import_session action', required: false },
+  maxItems: { type: 'number', description: 'Max storage items to read/export per storage type (default: 200)', required: false }
 };
 
 export default SessionManager;

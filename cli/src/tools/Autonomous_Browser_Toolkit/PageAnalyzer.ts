@@ -5,11 +5,13 @@ interface PageAnalyzerArgs {
   browserId: string;
   tabId?: string;
   analysis: 'full' | 'forms' | 'links' | 'interactive' | 'structure' | 'navigation';
+  maxItems?: number;
+  includeText?: boolean;
 }
 
 export async function PageAnalyzer(args: PageAnalyzerArgs, options: any = {}): Promise<ToolResult> {
   try {
-    const { browserId, tabId, analysis = 'full' } = args;
+    const { browserId, tabId, analysis = 'full', maxItems = 50, includeText = false } = args;
 
     // Import dynamically to avoid circular dependencies
     const { getBrowserRegistry } = await import('./BrowserController');
@@ -20,18 +22,18 @@ export async function PageAnalyzer(args: PageAnalyzerArgs, options: any = {}): P
       return new ToolResult(false, `Browser instance ${browserId} not found`);
     }
 
-    const page = tabId ? instance.pages.get(tabId) : Array.from(instance.pages.values())[0];
-    if (!page) {
+    const page = tabId ? instance.pages.get(tabId) : Array.from(instance.pages.values()).find(p => !p.isClosed());
+    if (!page || page.isClosed()) {
       return new ToolResult(false, 'No active page found');
     }
 
-    const analyzeFunction = await page.evaluate((analysisType) => {
+    const analyzeFunction = await page.evaluate((analysisType, limit, includeTextFlag) => {
       const results: any = {};
 
       // Forms analysis
       const analyzeForms = () => {
         const forms = Array.from(document.querySelectorAll('form'));
-        return forms.map((form, idx) => {
+        return forms.slice(0, limit).map((form, idx) => {
           const inputs = Array.from(form.querySelectorAll('input, textarea, select'));
           return {
             index: idx,
@@ -54,7 +56,7 @@ export async function PageAnalyzer(args: PageAnalyzerArgs, options: any = {}): P
       const analyzeLinks = () => {
         const links = Array.from(document.querySelectorAll('a[href]'));
         const linkData = links.map(link => ({
-          text: link.textContent?.trim() || '',
+          text: includeTextFlag ? (link.textContent?.trim() || '') : undefined,
           href: (link as HTMLAnchorElement).href,
           target: (link as HTMLAnchorElement).target || '_self',
           isExternal: (link as HTMLAnchorElement).hostname !== window.location.hostname
@@ -64,7 +66,7 @@ export async function PageAnalyzer(args: PageAnalyzerArgs, options: any = {}): P
           total: linkData.length,
           internal: linkData.filter(l => !l.isExternal).length,
           external: linkData.filter(l => l.isExternal).length,
-          links: linkData.slice(0, 50) // Limit to first 50
+          links: linkData.slice(0, limit)
         };
       };
 
@@ -80,11 +82,11 @@ export async function PageAnalyzer(args: PageAnalyzerArgs, options: any = {}): P
           clickableElements: clickable.length,
           totalInteractive: buttons.length + inputs.length + clickable.length,
           buttonTypes: buttons.map(btn => ({
-            text: btn.textContent?.trim() || '',
+            text: includeTextFlag ? (btn.textContent?.trim() || '') : undefined,
             type: (btn as HTMLButtonElement).type || 'button',
             id: btn.id || undefined,
             class: btn.className || undefined
-          })).slice(0, 20)
+          })).slice(0, limit)
         };
       };
 
@@ -147,7 +149,7 @@ export async function PageAnalyzer(args: PageAnalyzerArgs, options: any = {}): P
       }
 
       return results;
-    }, analysis);
+    }, analysis, Math.max(5, Math.min(maxItems, 200)), includeText);
 
     // Add page metadata
     const metadata = {
@@ -202,7 +204,9 @@ function generateSummary(analysis: any, type: string): string {
 (PageAnalyzer as any).parameters = {
   browserId: { type: 'string', description: 'Browser instance ID', required: true },
   tabId: { type: 'string', description: 'Tab ID (optional, uses first tab if not specified)', required: false },
-  analysis: { type: 'string', description: 'Analysis type: full, forms, links, interactive, structure, or navigation (default: full)', required: false }
+  analysis: { type: 'string', description: 'Analysis type: full, forms, links, interactive, structure, or navigation (default: full)', required: false },
+  maxItems: { type: 'number', description: 'Maximum items to include per section (default: 50, max: 200)', required: false },
+  includeText: { type: 'boolean', description: 'Include text labels for links/buttons (default: false)', required: false }
 };
 
 export default PageAnalyzer;

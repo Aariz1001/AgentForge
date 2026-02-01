@@ -1,4 +1,5 @@
-import { Page, ElementHandle } from 'playwright';
+import type { Page, ElementHandle } from 'puppeteer';
+import { getBrowserRegistry } from './BrowserController';
 
 /**
  * ElementInteractor Tool for Autonomous Browser Toolkit
@@ -9,20 +10,27 @@ import { Page, ElementHandle } from 'playwright';
 
 // ========== Type Definitions ==========
 
-export type ActionType = 'click' | 'type' | 'hover' | 'select' | 'check' | 'uncheck' | 'drag' | 'scroll_to';
+export type ActionType = 'click' | 'type' | 'hover' | 'select' | 'check' | 'uncheck' | 'drag' | 'scroll_to' | 'scroll';
 
 export interface ElementInteractorInput {
   action: ActionType;
   browserId: string;
+  tabId?: string;
   selector?: string;
   xpath?: string;
   text?: string;
   value?: string;
   options?: string[];
   coordinates?: { x: number; y: number };
+  scrollBy?: { x?: number; y?: number };
+  scrollTo?: 'top' | 'bottom';
   waitForElement?: boolean;
   timeout?: number;
   captureScreenshot?: boolean;
+  autoScroll?: boolean;
+  autoWaitForNavigation?: boolean;
+  navigationTimeout?: number;
+  autoRetry?: number;
 }
 
 export interface ElementPosition {
@@ -63,28 +71,6 @@ export interface ToolResult {
   metadata?: Record<string, any>;
 }
 
-// ========== Browser Session Manager ==========
-
-class BrowserSessionManager {
-  private static sessions = new Map<string, Page>();
-
-  static registerSession(id: string, page: Page): void {
-    this.sessions.set(id, page);
-  }
-
-  static getSession(id: string): Page | undefined {
-    return this.sessions.get(id);
-  }
-
-  static removeSession(id: string): void {
-    this.sessions.delete(id);
-  }
-
-  static hasSession(id: string): boolean {
-    return this.sessions.has(id);
-  }
-}
-
 // ========== Element Finder ==========
 
 class ElementFinder {
@@ -101,22 +87,42 @@ class ElementFinder {
     try {
       // Strategy 1: CSS Selector
       if (selector) {
-        const element = await page.waitForSelector(selector, { timeout, state: 'attached' });
-        return element;
+        const element = await page.waitForSelector(selector, { timeout });
+        return element as ElementHandle | null;
       }
 
       // Strategy 2: XPath
       if (xpath) {
-        const locator = page.locator(`xpath=${xpath}`).first();
-        await locator.waitFor({ timeout, state: 'attached' });
-        return await locator.elementHandle();
+        await page.waitForFunction(
+          (xp: string) => {
+            const result = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+            return !!result.singleNodeValue;
+          },
+          { timeout },
+          xpath
+        );
+        const handle = await page.evaluateHandle((xp: string) => {
+          const result = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+          return result.singleNodeValue || null;
+        }, xpath);
+        return handle.asElement() as ElementHandle<Element> | null;
       }
 
       // Strategy 3: Text Content
       if (text) {
-        const locator = page.getByText(text, { exact: false }).first();
-        await locator.waitFor({ timeout, state: 'attached' });
-        return await locator.elementHandle();
+        await page.waitForFunction(
+          (t: string) => {
+            const elements = Array.from(document.querySelectorAll('body *')) as HTMLElement[];
+            return elements.some(el => (el.innerText || '').includes(t));
+          },
+          { timeout },
+          text
+        );
+        const handle = await page.evaluateHandle((t: string) => {
+          const elements = Array.from(document.querySelectorAll('body *')) as HTMLElement[];
+          return elements.find(el => (el.innerText || '').includes(t)) || null;
+        }, text);
+        return handle.asElement() as ElementHandle<Element> | null;
       }
 
       return null;
@@ -186,18 +192,35 @@ export class ElementInteractor {
         };
       }
 
-      // Get browser session
-      const page = BrowserSessionManager.getSession(input.browserId);
-      if (!page) {
+      const registry = getBrowserRegistry();
+      const instance = registry.get(input.browserId);
+      if (!instance) {
         return {
           success: false,
-          error: `Browser session '${input.browserId}' not found. Please create a browser session first.`,
+          error: `Browser instance '${input.browserId}' not found. Please create a browser instance first using BrowserController.`,
+        };
+      }
+
+      let page: Page | undefined = input.tabId ? instance.pages.get(input.tabId) : undefined;
+      if (!page) {
+        page = Array.from(instance.pages.values()).find(p => !p.isClosed());
+      }
+
+      if (!page || page.isClosed()) {
+        return {
+          success: false,
+          error: `Browser instance '${input.browserId}' has no active pages. Create a new tab first.`,
         };
       }
 
       // Set defaults
-      const timeout = input.timeout ?? 30000;
+      const clampTimeout = (value: number) => Math.min(Math.max(value, 3000), 45000);
+      const timeout = clampTimeout(input.timeout ?? 15000);
       const waitForElement = input.waitForElement ?? true;
+      const autoScroll = input.autoScroll ?? true;
+      const autoWaitForNavigation = input.autoWaitForNavigation ?? (input.action === 'click');
+      const navigationTimeout = clampTimeout(input.navigationTimeout ?? 8000);
+      const autoRetry = Math.min(Math.max(input.autoRetry ?? 1, 0), 3);
 
       // Find element (if not coordinate-based action)
       let element: ElementHandle | null = null;
@@ -232,12 +255,61 @@ export class ElementInteractor {
         }
       }
 
+      // Auto-scroll element into view for non-scroll actions
+      if (autoScroll && element && input.action !== 'scroll' && input.action !== 'scroll_to') {
+        try {
+          await element.evaluate((el: Element) => {
+            el.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'center' });
+          });
+          await new Promise(resolve => setTimeout(resolve, 100));
+        } catch {
+          warnings.push('Auto-scroll into view failed; proceeding anyway.');
+        }
+      }
+
       // Perform action
-      const actionResult = await this.performAction(page, element, input);
-      if (!actionResult.success) {
+      const isRetryable = (message: string) =>
+        /detached|not visible|not found|not attached|Execution context was destroyed|Node is detached/i.test(message);
+
+      let actionResult: { success: true; message: string } | { success: false; error: string } | null = null;
+      let navigated = false;
+      let attempt = 0;
+
+      while (attempt <= autoRetry) {
+        const navPromise = autoWaitForNavigation
+          ? page.waitForNavigation({ timeout: navigationTimeout, waitUntil: 'domcontentloaded' })
+              .then(() => true)
+              .catch(() => false)
+          : Promise.resolve(false);
+
+        actionResult = await this.performAction(page, element, input);
+        navigated = await navPromise;
+
+        if (actionResult.success) {
+          break;
+        }
+
+        if (attempt < autoRetry && isRetryable(actionResult.error)) {
+          warnings.push(`Retrying action due to: ${actionResult.error}`);
+          const findTimeout = waitForElement ? timeout : 1000;
+          element = await ElementFinder.findElement(
+            page,
+            input.selector,
+            input.xpath,
+            input.text,
+            findTimeout
+          );
+          attempt++;
+          continue;
+        }
+
+        break;
+      }
+
+      if (!actionResult || !actionResult.success) {
         return {
           success: false,
-          error: actionResult.error,
+          error: actionResult ? actionResult.error : 'Action failed without result',
         };
       }
 
@@ -255,8 +327,8 @@ export class ElementInteractor {
       let screenshot: string | undefined;
       if (input.captureScreenshot && element) {
         try {
-          const screenshotBuffer = await element.screenshot({ type: 'png' });
-          screenshot = screenshotBuffer.toString('base64');
+          const screenshotBase64 = await element.screenshot({ type: 'png', encoding: 'base64' });
+          screenshot = typeof screenshotBase64 === 'string' ? screenshotBase64 : undefined;
         } catch (error) {
           warnings.push('Could not capture element screenshot.');
         }
@@ -279,6 +351,10 @@ export class ElementInteractor {
         metadata: {
           browserId: input.browserId,
           action: input.action,
+          navigated,
+          retries: attempt,
+          autoScroll,
+          autoWaitForNavigation,
           timestamp: new Date().toISOString(),
         },
       };
@@ -302,7 +378,7 @@ export class ElementInteractor {
       return 'Action is required';
     }
 
-    const validActions: ActionType[] = ['click', 'type', 'hover', 'select', 'check', 'uncheck', 'drag', 'scroll_to'];
+    const validActions: ActionType[] = ['click', 'type', 'hover', 'select', 'check', 'uncheck', 'drag', 'scroll_to', 'scroll'];
     if (!validActions.includes(input.action)) {
       return `Invalid action. Must be one of: ${validActions.join(', ')}`;
     }
@@ -314,7 +390,7 @@ export class ElementInteractor {
     // Validate element selector is provided (unless clicking coordinates)
     if (input.action === 'click' && input.coordinates) {
       // Coordinate click is valid
-    } else if (!input.selector && !input.xpath && !input.text) {
+    } else if (input.action !== 'scroll' && !input.selector && !input.xpath && !input.text) {
       return 'At least one of selector, xpath, or text must be provided';
     }
 
@@ -360,7 +436,7 @@ export class ElementInteractor {
           
           await element.click({ clickCount: 3 });
           await page.keyboard.press('Backspace');
-          await element.fill(input.value);
+          await element.type(input.value);
           
           return { success: true, message: `Typed "${input.value}" into element` };
 
@@ -374,18 +450,38 @@ export class ElementInteractor {
           if (!input.options || input.options.length === 0) {
             return { success: false, error: 'No options provided for select' };
           }
-          
-          await element.selectOption(input.options);
+          if (input.selector) {
+            await page.select(input.selector, ...input.options);
+          } else {
+            await element.evaluate((el: Element, values: string[]) => {
+              if (el instanceof HTMLSelectElement) {
+                for (const option of Array.from(el.options)) {
+                  option.selected = values.includes(option.value) || values.includes(option.text);
+                }
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            }, input.options);
+          }
           return { success: true, message: `Selected options: ${input.options.join(', ')}` };
 
         case 'check':
           if (!element) return { success: false, error: 'Element not found' };
-          await element.check();
+          await element.evaluate((el: Element) => {
+            if (el instanceof HTMLInputElement) {
+              el.checked = true;
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          });
           return { success: true, message: 'Element checked' };
 
         case 'uncheck':
           if (!element) return { success: false, error: 'Element not found' };
-          await element.uncheck();
+          await element.evaluate((el: Element) => {
+            if (el instanceof HTMLInputElement) {
+              el.checked = false;
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          });
           return { success: true, message: 'Element unchecked' };
 
         case 'drag':
@@ -403,8 +499,24 @@ export class ElementInteractor {
 
         case 'scroll_to':
           if (!element) return { success: false, error: 'Element not found' };
-          await element.scrollIntoViewIfNeeded();
+          await element.evaluate((el: Element) => {
+            el.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'center' });
+          });
           return { success: true, message: 'Scrolled element into view' };
+
+        case 'scroll':
+          if (input.scrollTo === 'top') {
+            await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'auto' }));
+            return { success: true, message: 'Scrolled to top' };
+          }
+          if (input.scrollTo === 'bottom') {
+            await page.evaluate(() => window.scrollTo({ top: document.body.scrollHeight, behavior: 'auto' }));
+            return { success: true, message: 'Scrolled to bottom' };
+          }
+          const dx = input.scrollBy?.x ?? 0;
+          const dy = input.scrollBy?.y ?? 800;
+          await page.evaluate(({ x, y }) => window.scrollBy({ left: x, top: y, behavior: 'auto' }), { x: dx, y: dy });
+          return { success: true, message: `Scrolled by (${dx}, ${dy})` };
 
         default:
           return { success: false, error: `Unknown action: ${input.action}` };
@@ -417,26 +529,6 @@ export class ElementInteractor {
     }
   }
 
-  /**
-   * Register a browser page with a session ID
-   */
-  static registerBrowserSession(id: string, page: Page): void {
-    BrowserSessionManager.registerSession(id, page);
-  }
-
-  /**
-   * Remove a browser session
-   */
-  static removeBrowserSession(id: string): void {
-    BrowserSessionManager.removeSession(id);
-  }
-
-  /**
-   * Check if a browser session exists
-   */
-  static hasBrowserSession(id: string): boolean {
-    return BrowserSessionManager.hasSession(id);
-  }
 }
 
 // ========== Exports ==========
@@ -463,12 +555,16 @@ export const ElementInteractorMetadata = {
     properties: {
       action: {
         type: 'string',
-        enum: ['click', 'type', 'hover', 'select', 'check', 'uncheck', 'drag', 'scroll_to'],
+        enum: ['click', 'type', 'hover', 'select', 'check', 'uncheck', 'drag', 'scroll_to', 'scroll'],
         description: 'The interaction action to perform',
       },
       browserId: {
         type: 'string',
         description: 'Browser session identifier',
+      },
+      tabId: {
+        type: 'string',
+        description: 'Tab ID to target (optional; defaults to first available tab)',
       },
       selector: {
         type: 'string',
@@ -499,6 +595,19 @@ export const ElementInteractorMetadata = {
         },
         description: 'Target coordinates for click or drag actions',
       },
+      scrollBy: {
+        type: 'object',
+        properties: {
+          x: { type: 'number' },
+          y: { type: 'number' }
+        },
+        description: 'Scroll by x/y pixels for scroll action (default y=800)',
+      },
+      scrollTo: {
+        type: 'string',
+        enum: ['top', 'bottom'],
+        description: 'Scroll to top or bottom for scroll action',
+      },
       waitForElement: {
         type: 'boolean',
         default: true,
@@ -506,13 +615,33 @@ export const ElementInteractorMetadata = {
       },
       timeout: {
         type: 'number',
-        default: 30000,
+        default: 15000,
         description: 'Timeout in milliseconds for element finding',
       },
       captureScreenshot: {
         type: 'boolean',
         default: false,
         description: 'Whether to capture element screenshot',
+      },
+      autoScroll: {
+        type: 'boolean',
+        default: true,
+        description: 'Automatically scroll element into view before interaction',
+      },
+      autoWaitForNavigation: {
+        type: 'boolean',
+        default: false,
+        description: 'Wait briefly for navigation after click actions (defaults to true for click when omitted)',
+      },
+      navigationTimeout: {
+        type: 'number',
+        default: 8000,
+        description: 'Navigation wait timeout in milliseconds when autoWaitForNavigation is enabled',
+      },
+      autoRetry: {
+        type: 'number',
+        default: 1,
+        description: 'Retry count for transient failures (0-3)',
       },
     },
     required: ['action', 'browserId'],

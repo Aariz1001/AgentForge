@@ -120,55 +120,28 @@ export class OpenRouterService implements LLMProvider {
 
     const model = options.model || this.config.get('openrouter.model');
     const configuredMaxTokens = options.maxTokens ?? this.config.get('openrouter.maxTokens');
-    const maxOutputTokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
+    const max_tokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
       ? configuredMaxTokens
       : undefined;
 
-    // Separate system message
-    let instructions: string | undefined;
-    let input: any[] = messages;
-
-    if (messages.length > 0 && messages[0].role === 'system') {
-      instructions = String(messages[0].content);
-      input = messages.slice(1);
-    }
-
-    const callArgs: any = {
+    const requestBody: any = {
       model,
-      input,
+      messages,
       temperature: options.temperature ?? this.config.get('openrouter.temperature') ?? 0.7,
-      ...(maxOutputTokens ? { maxOutputTokens } : {}),
-      ...(options.reasoning ? { reasoning: options.reasoning } : {})
+      ...(max_tokens ? { max_tokens } : {})
     };
 
-    if (instructions) {
-      callArgs.instructions = instructions;
-    }
-
     try {
-      const result = this.client.callModel(callArgs);
-      const response = await result.getResponse();
-
+      const response = await this.client.chat.send(requestBody);
+      const content = response.choices?.[0]?.message?.content || '';
+      
       return {
-        content: response.text || '',
-        reasoning: response.reasoning,
-        usage: response.usage,
+        content,
+        usage: response.usage || undefined,
         provider: this.name,
         model
       };
     } catch (error: any) {
-      // Retry without reasoning if unsupported
-      if (options.reasoning && /reasoning|unknown parameter|unsupported/i.test(error.message || '')) {
-        delete callArgs.reasoning;
-        const result = this.client.callModel(callArgs);
-        const response = await result.getResponse();
-        return {
-          content: response.text || '',
-          usage: response.usage,
-          provider: this.name,
-          model
-        };
-      }
       throw error;
     }
   }
@@ -187,68 +160,43 @@ export class OpenRouterService implements LLMProvider {
 
     const model = options.model || this.config.get('openrouter.model');
     const configuredMaxTokens = options.maxTokens ?? this.config.get('openrouter.maxTokens');
-    const maxOutputTokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
+    const max_tokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
       ? configuredMaxTokens
       : undefined;
 
-    let instructions: string | undefined;
-    let input: any[] = messages;
-
-    if (messages.length > 0 && messages[0].role === 'system') {
-      instructions = String(messages[0].content);
-      input = messages.slice(1);
-    }
-
-    const callArgs: any = {
+    const requestBody: any = {
       model,
-      input,
+      messages,
       temperature: options.temperature ?? 0.7,
-      ...(maxOutputTokens ? { maxOutputTokens } : {}),
-      ...(options.reasoning ? { reasoning: options.reasoning } : {})
+      stream: true,
+      ...(max_tokens ? { max_tokens } : {})
     };
 
-    if (instructions) {
-      callArgs.instructions = instructions;
-    }
-
     try {
-      const result = this.client.callModel(callArgs);
+      const streamResult = await this.client.chat.send(requestBody);
       let fullContent = '';
-      let fullReasoning = '';
+      let lastUsage: any = undefined;
 
-      for await (const delta of result.getTextStream()) {
-        fullContent += delta;
-        onChunk(delta);
-      }
-
-      try {
-        for await (const reason of result.getReasoningStream()) {
-          fullReasoning += reason;
-        }
-      } catch {
-        // Reasoning stream might not be available
-      }
-
-      const response = await result.getResponse();
-      return {
-        content: fullContent,
-        reasoning: fullReasoning || undefined,
-        usage: response.usage
-      };
-    } catch (error: any) {
-      if (options.reasoning && /reasoning|unknown parameter|unsupported/i.test(error.message || '')) {
-        delete callArgs.reasoning;
-        const result = this.client.callModel(callArgs);
-        let fullContent = '';
-
-        for await (const delta of result.getTextStream()) {
+      // The stream returns ChatStreamingResponseChunkData objects
+      for await (const chunkData of streamResult) {
+        // Extract delta content from the chunk
+        const delta = chunkData.choices?.[0]?.delta?.content || '';
+        if (delta) {
           fullContent += delta;
           onChunk(delta);
         }
 
-        const response = await result.getResponse();
-        return { content: fullContent, usage: response.usage };
+        // Capture usage info if present (typically in the last chunk)
+        if (chunkData.usage) {
+          lastUsage = chunkData.usage;
+        }
       }
+
+      return {
+        content: fullContent,
+        usage: lastUsage
+      };
+    } catch (error: any) {
       throw error;
     }
   }
