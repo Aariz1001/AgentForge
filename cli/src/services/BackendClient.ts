@@ -248,7 +248,7 @@ export class BackendClient {
   }
   
   /**
-   * Direct OpenRouter call using SDK (non-streaming)
+   * Direct OpenRouter call using SDK callModel pattern (non-streaming)
    */
   async openRouterComplete(messages: any[], options: any = {}): Promise<any> {
     if (!this.orClient) {
@@ -257,36 +257,73 @@ export class BackendClient {
 
     const model = options.model || this.config.get('openrouter.model');
     const configuredMaxTokens = options.maxTokens ?? this.config.get('openrouter.maxTokens');
-    const maxTokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
+    const maxOutputTokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
       ? configuredMaxTokens
       : undefined;
+
+    // Separate system message if it's the first one to use the instructions parameter
+    let instructions: string | undefined;
+    let input: any[] = messages;
+
+    if (messages.length > 0 && messages[0].role === 'system') {
+      instructions = String(messages[0].content);
+      input = messages.slice(1);
+    }
     
     const send = async (withReasoning: boolean) => {
-      return this.orClient.chat.send({
+      const callArgs: any = {
         model,
-        messages,
+        input,
         temperature: options.temperature ?? this.config.get('openrouter.temperature') ?? 0.7,
-        ...(maxTokens ? { max_tokens: maxTokens } : {}),
-        stream: false,
+        ...(maxOutputTokens ? { maxOutputTokens } : {}),
         ...(withReasoning && options.reasoning ? { reasoning: options.reasoning } : {})
-      }, {
-        fetchOptions: {
-          headers: {
-            'HTTP-Referer': 'https://github.com/agentforge',
-            'X-Title': 'AgentForge'
-          }
-        }
-      });
+      };
+      
+      if (instructions) {
+        callArgs.instructions = instructions;
+      }
+
+      const result = this.orClient.callModel(callArgs);
+      return await result.getResponse();
     };
 
     try {
       const response = await send(true);
+      
+      // Normalize response to maintain compatibility with existing ChatSession logic
+      // existing logic expects response.choices[0].message.content
+      // or similar from openRouter
+      if (response && response.text && !response.choices) {
+        return {
+          ...response,
+          choices: [{
+            message: {
+              role: 'assistant',
+              content: response.text,
+              reasoning: response.reasoning
+            }
+          }],
+          usage: response.usage
+        };
+      }
       return response;
     } catch (error: any) {
       const message = error?.message || '';
       if (options.reasoning && /reasoning|unknown parameter|unsupported|invalid/i.test(message)) {
         try {
           const fallback = await send(false);
+          if (fallback && fallback.text && !fallback.choices) {
+             return {
+              ...fallback,
+              choices: [{
+                message: {
+                  role: 'assistant',
+                  content: fallback.text
+                }
+              }],
+              usage: fallback.usage
+            };
+          }
           return fallback;
         } catch (inner: any) {
           error = inner;
@@ -296,12 +333,12 @@ export class BackendClient {
       if (error.response) {
         console.error('[OpenRouter Response Data]:', error.response.data);
       }
-      throw new Error(error.message || 'OpenRouter request failed');
+      throw new Error(this.sanitizeError(error));
     }
   }
-  
+
   /**
-   * Stream OpenRouter completion using SDK
+   * Stream OpenRouter completion using SDK callModel pattern
    */
   async streamOpenRouter(messages: any[], onChunk: (chunk: string) => void, options: any = {}): Promise<{ content: string, reasoning?: string, usage?: any }> {
     if (!this.orClient) {
@@ -310,104 +347,94 @@ export class BackendClient {
 
     const model = options.model || this.config.get('openrouter.model');
     const configuredMaxTokens = options.maxTokens ?? this.config.get('openrouter.maxTokens');
-    const maxTokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
+    const maxOutputTokens = typeof configuredMaxTokens === 'number' && configuredMaxTokens > 0
       ? configuredMaxTokens
       : undefined;
+
+    let instructions: string | undefined;
+    let input: any[] = messages;
+
+    if (messages.length > 0 && messages[0].role === 'system') {
+      instructions = String(messages[0].content);
+      input = messages.slice(1);
+    }
     
-    const sendStream = async (withReasoning: boolean) => {
-      return this.orClient.chat.send({
+    const getStream = (withReasoning: boolean) => {
+      const callArgs: any = {
         model,
-        messages,
+        input,
         temperature: options.temperature ?? 0.7,
-        ...(maxTokens ? { max_tokens: maxTokens } : {}),
-        stream: true,
-        streamOptions: {
-          includeUsage: true
-        },
-        // Support OpenRouter's reasoning. 
-        // We only add include_reasoning if explicitly requested or if it's a known reasoning model
+        ...(maxOutputTokens ? { maxOutputTokens } : {}),
         ...(withReasoning && options.reasoning ? { 
-          reasoning: typeof options.reasoning === 'object' ? options.reasoning : { enabled: true },
-          ...(options.include_reasoning ? { include_reasoning: true } : {})
+          reasoning: typeof options.reasoning === 'object' ? options.reasoning : { enabled: true }
         } : {})
-      });
+      };
+
+      if (instructions) {
+        callArgs.instructions = instructions;
+      }
+
+      return this.orClient.callModel(callArgs);
     };
 
     try {
-      const stream = await sendStream(true);
+      const result = getStream(true);
 
       let fullContent = '';
       let fullReasoning = '';
-      let usage: any = null;
 
-      for await (const chunk of stream) {
-        const choice = chunk.choices?.[0];
-        if (choice?.delta) {
-          const content = choice.delta.content || '';
-          const reasoning = choice.delta.reasoning || '';
-          
-          if (content) {
-            fullContent += content;
-            onChunk(content);
-          } else if (reasoning) {
-            fullReasoning += reasoning;
-            // Only include reasoning in content and onChunk if explicitly requested
-            if (options.includeReasoningInContent) {
-              fullContent += reasoning;
-              onChunk(reasoning);
-            }
-          }
-        }
-        if (chunk.usage) {
-          usage = chunk.usage;
-        }
+      for await (const delta of result.getTextStream()) {
+        fullContent += delta;
+        onChunk(delta);
       }
 
-      return { content: fullContent, reasoning: fullReasoning, usage };
+      // Check for reasoning if supported
+      try {
+        for await (const reason of result.getReasoningStream()) {
+          fullReasoning += reason;
+          if (options.includeReasoningInContent) {
+            fullContent += reason;
+            onChunk(reason);
+          }
+        }
+      } catch (e) {
+        // Reasoning stream might not be supported/available
+      }
+
+      const response = await result.getResponse();
+      return { content: fullContent, reasoning: fullReasoning, usage: response.usage };
     } catch (error: any) {
       const message = error?.message || '';
       if (options.reasoning && /reasoning|unknown parameter|unsupported|invalid/i.test(message)) {
         try {
-          const stream = await sendStream(false);
-
+          const result = getStream(false);
           let fullContent = '';
-          let fullReasoning = '';
-          let usage: any = null;
-
-          for await (const chunk of stream) {
-            const choice = chunk.choices?.[0];
-            if (choice?.delta) {
-              const content = choice.delta.content || '';
-              const reasoning = choice.delta.reasoning || '';
-              
-              if (content) {
-                fullContent += content;
-                onChunk(content);
-              } 
-              if (reasoning) {
-                fullReasoning += reasoning;
-                if (options.includeReasoningInContent) {
-                   fullContent += reasoning;
-                   onChunk(reasoning);
-                }
-              }
-            }
-            if (chunk.usage) {
-              usage = chunk.usage;
-            }
+          for await (const delta of result.getTextStream()) {
+            fullContent += delta;
+            onChunk(delta);
           }
-
-          return { content: fullContent, reasoning: fullReasoning, usage };
+          const response = await result.getResponse();
+          return { content: fullContent, usage: response.usage };
         } catch (inner: any) {
           error = inner;
         }
       }
       console.error('[OpenRouter Stream Error]:', error);
-      if (error.response) {
-        console.error('[OpenRouter Stream Response Data]:', error.response.data);
-      }
-      throw new Error(error.message || 'OpenRouter stream failed');
+      throw new Error(this.sanitizeError(error));
     }
+  }
+
+  /**
+   * Sanitize error messages to avoid HTML dumps
+   */
+  private sanitizeError(error: any): string {
+    const message = error.message || 'Unknown error';
+    if (message.includes('<!DOCTYPE html>') || message.includes('<html>')) {
+      const statusMatch = message.match(/Error code (\d+)/i) || message.match(/Status (\d+)/i);
+      const code = statusMatch ? statusMatch[1] : (error.statusCode || '5xx');
+      return `OpenRouter API Error: ${code} (Internal Server Error/Bad Gateway). The upstream provider is currently down or overwhelmed. Please try again in 1-2 minutes.`;
+    }
+    return message;
   }
 
   /**

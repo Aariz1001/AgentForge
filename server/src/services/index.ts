@@ -15,6 +15,8 @@ export { PlanWriter } from './plan-writer';
 export { SwarmOrchestrator } from './swarm-orchestrator';
 export { SwarmStore } from './swarm-store';
 export { SwarmAgent } from './swarm-agent';
+export { MCPManagerService, MCPServer } from './mcp-manager';
+export { SkillManagerService, Skill } from './skill-manager';
 export {
   SwarmRunRequest,
   SwarmRunResult,

@@ -5,11 +5,12 @@ import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { ensureAdb } from './utils';
 
 const execAsync = promisify(exec);
 
 interface DeviceOrchestratorArgs {
-  action: 'boot_emulator' | 'wait_for_boot' | 'install_apk' | 'check_device' | 'kill_emulator' | 'screenshot';
+  action: 'boot' | 'boot_emulator' | 'wait_for_boot' | 'install_apk' | 'check_device' | 'kill_emulator' | 'screenshot' | 'list_devices' | 'list_avds' | 'setup_env';
   deviceId?: string;
   emulatorName?: string;
   apkPath?: string;
@@ -30,6 +31,9 @@ export async function DeviceOrchestrator(args: any, options: any = {}): Promise<
   const tempFiles: string[] = [];
   
   try {
+    // Attempt to ensure ADB is in PATH or find it
+    await ensureAdb();
+
     const typedArgs = args as DeviceOrchestratorArgs;
     const { 
       action, 
@@ -46,6 +50,10 @@ export async function DeviceOrchestrator(args: any, options: any = {}): Promise<
     }
 
     switch (action) {
+      case 'setup_env':
+        return await setupEnv();
+
+      case 'boot':
       case 'boot_emulator':
         return await bootEmulator(emulatorName, snapshot, timeout, tempFiles);
       
@@ -72,6 +80,12 @@ export async function DeviceOrchestrator(args: any, options: any = {}): Promise<
         tempFiles.push(tmpPath);
         return await takeScreenshot(deviceId, tmpPath);
       
+      case 'list_devices':
+        return await listDevices();
+
+      case 'list_avds':
+        return await listAvds();
+      
       default:
         return new ToolResult(false, `Unknown action: ${action}`);
     }
@@ -81,6 +95,73 @@ export async function DeviceOrchestrator(args: any, options: any = {}): Promise<
     return new ToolResult(false, `DeviceOrchestrator failed: ${error.message}`);
   } finally {
     cleanupTempFiles(tempFiles);
+  }
+}
+
+async function setupEnv(): Promise<ToolResult> {
+  const status: any = {
+    adbFound: false,
+    emulatorFound: false,
+    environmentVariables: {}
+  };
+
+  try {
+    await ensureAdb();
+    const { stdout } = await execAsync('adb version');
+    status.adbFound = true;
+    status.adbVersion = stdout.trim();
+  } catch (e) {
+    status.adbFound = false;
+  }
+
+  try {
+    const { stdout } = await execAsync('emulator -version');
+    status.emulatorFound = true;
+    status.emulatorVersion = stdout.trim();
+  } catch (e) {
+    status.emulatorFound = false;
+  }
+
+  status.environmentVariables = {
+    ANDROID_HOME: process.env.ANDROID_HOME || 'not set',
+    ANDROID_SDK_ROOT: process.env.ANDROID_SDK_ROOT || 'not set',
+    PATH: process.env.PATH?.split(path.delimiter).slice(0, 5).join('...') // Truncated
+  };
+
+  if (status.adbFound && status.emulatorFound) {
+    return new ToolResult(true, 'Android environment is correctly configured', status);
+  } else {
+    let advice = '';
+    if (!status.adbFound) advice += 'ADB not found. Install Android SDK Platform-Tools. ';
+    if (!status.emulatorFound) advice += 'Emulator not found. Install Android SDK Emulator. ';
+    return new ToolResult(false, `Environment issue: ${advice.trim()}`, status);
+  }
+}
+
+async function listDevices(): Promise<ToolResult> {
+  try {
+    const { stdout } = await execAsync('adb devices');
+    const lines = stdout.trim().split('\n').slice(1);
+    const devices = lines
+      .filter(line => line.trim())
+      .map(line => {
+        const [id, state] = line.split('\t');
+        return { id, state };
+      });
+    
+    return new ToolResult(true, `Found ${devices.length} devices`, { devices });
+  } catch (error: any) {
+    return new ToolResult(false, `Failed to list devices: ${error.message}`);
+  }
+}
+
+async function listAvds(): Promise<ToolResult> {
+  try {
+    const { stdout } = await execAsync('emulator -list-avds');
+    const avds = stdout.trim().split('\n').filter(line => line.trim());
+    return new ToolResult(true, `Found ${avds.length} AVDs`, { avds });
+  } catch (error: any) {
+    return new ToolResult(false, `Failed to list AVDs: ${error.message}`);
   }
 }
 
@@ -107,17 +188,26 @@ async function bootEmulator(emulatorName: string | undefined, snapshot: string |
     
     emulatorProcess.unref();
 
-    await new Promise(resolve => setTimeout(resolve, 8000));
+    console.log(chalk.blue(`Emulator ${emulatorName} starting...`));
     
-    const { stdout: devices } = await execAsync('adb devices');
-    const emulatorLine = devices.split('\n').find(line => line.includes('emulator') && line.includes('\tdevice'));
+    // Poll for the emulator to appear in 'adb devices'
+    const findIdTimeout = 30000;
+    const startFind = Date.now();
+    let emulatorLine: string | undefined;
+
+    while (Date.now() - startFind < findIdTimeout) {
+      const { stdout: devices } = await execAsync('adb devices', { timeout: 5000 });
+      emulatorLine = devices.split('\n').find(line => line.includes('emulator') && (line.includes('\tdevice') || line.includes('\toffline')));
+      if (emulatorLine) break;
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
     
     if (!emulatorLine) {
-      return new ToolResult(false, 'Emulator process started but device ID not found in adb devices. Check if emulator is booting.');
+      return new ToolResult(false, 'Emulator process started but device ID not found in adb devices after 30s. Check if emulator is booting.');
     }
     
     const deviceId = emulatorLine.split('\t')[0];
-    console.log(chalk.blue(`Emulator started with ID: ${deviceId}`));
+    console.log(chalk.blue(`Emulator identified with ID: ${deviceId}. Waiting for system boot...`));
     
     return await waitForDeviceBoot(deviceId, timeout, true);
 
@@ -322,9 +412,9 @@ function extractPackageName(installOutput: string): string | undefined {
 (DeviceOrchestrator as any).parameters = {
   action: {
     type: "string",
-    description: "Action to perform: 'boot_emulator' (start AVD), 'wait_for_boot' (poll until ready), 'install_apk' (install app), 'check_device' (get status), 'kill_emulator' (stop emulator), or 'screenshot' (capture screen)",
+    description: "Action to perform: 'setup_env' (diagnostic check and ADB path config), 'boot' (alias for boot_emulator), 'boot_emulator' (start AVD), 'wait_for_boot' (poll until ready), 'install_apk' (install app), 'check_device' (get status), 'kill_emulator' (stop emulator), 'screenshot' (capture screen), 'list_devices' (list connected devices), or 'list_avds' (list available virtual devices)",
     required: true,
-    enum: ["boot_emulator", "wait_for_boot", "install_apk", "check_device", "kill_emulator", "screenshot"]
+    enum: ["setup_env", "boot", "boot_emulator", "wait_for_boot", "install_apk", "check_device", "kill_emulator", "screenshot", "list_devices", "list_avds"]
   },
   deviceId: {
     type: "string",

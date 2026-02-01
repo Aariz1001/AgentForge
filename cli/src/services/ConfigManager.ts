@@ -66,6 +66,18 @@ const DEFAULT_CONFIG = {
     maxAgents: 8,
     defaultAgents: 3,
     concurrency: 3
+  },
+  mcp: {
+    servers: [
+      { id: 'context7', url: 'https://mcp.context7.io', name: 'Context7 Documentation Server' },
+      { id: 'langchain', url: 'https://docs.langchain.com/mcp', name: 'LangChain Docs Server' }
+    ]
+  },
+  skills: {
+    paths: [
+      join(homedir(), '.copilot', 'skills'),
+      join(homedir(), '.claude', 'skills')
+    ]
   }
 };
 
@@ -119,10 +131,35 @@ export class ConfigManager {
             defaultAgents: { type: 'number', minimum: 1 },
             concurrency: { type: 'number', minimum: 1 }
           }
+        },
+        mcp: {
+          type: 'object',
+          properties: {
+            servers: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  url: { type: 'string' },
+                  name: { type: 'string' }
+                }
+              }
+            }
+          }
+        },
+        skills: {
+          type: 'object',
+          properties: {
+            paths: {
+              type: 'array',
+              items: { type: 'string' }
+            }
+          }
         }
       }
     });
-    
+
     // Also check for local .agentforge config
     this._loadLocalConfig();
   }

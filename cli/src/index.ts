@@ -123,6 +123,85 @@ program
     await cf.run();
   });
 
+// MCP Command
+program
+  .command('mcp')
+  .description('Manage Model Context Protocol (MCP) servers')
+  .option('-l, --list', 'List configured MCP servers')
+  .option('-a, --add <id,url,name>', 'Add a new MCP server (id,url,name)')
+  .option('-r, --remove <id>', 'Remove an MCP server')
+  .action(async (options) => {
+    const config = new ConfigManager();
+    const mcpConfig = config.get('mcp') || { servers: [] };
+    
+    if (options.add) {
+      const [id, url, name] = options.add.split(',');
+      if (!id || !url) {
+        console.error(chalk.red('Error: id and url are required for adding a server. Usage: --add id,url,name'));
+        return;
+      }
+      mcpConfig.servers.push({ id, url, name: name || id });
+      config.set('mcp', mcpConfig);
+      console.log(chalk.green(`✓ Added MCP server: ${name || id}`));
+    } else if (options.remove) {
+      const initialLength = mcpConfig.servers.length;
+      mcpConfig.servers = mcpConfig.servers.filter((s: any) => s.id !== options.remove);
+      if (mcpConfig.servers.length < initialLength) {
+        config.set('mcp', mcpConfig);
+        console.log(chalk.green(`✓ Removed MCP server: ${options.remove}`));
+      } else {
+        console.log(chalk.yellow(`! MCP server not found: ${options.remove}`));
+      }
+    } else {
+      console.log(chalk.bold('\n🌐 Configured MCP Servers\n'));
+      if (mcpConfig.servers.length === 0) {
+        console.log(chalk.gray('  No MCP servers configured.'));
+      } else {
+        mcpConfig.servers.forEach((s: any) => {
+          console.log(`  ${chalk.cyan(s.id.padEnd(15))} ${chalk.white((s.name || '').padEnd(25))} ${chalk.gray(s.url)}`);
+        });
+      }
+      console.log();
+    }
+  });
+
+// Skills Command
+program
+  .command('skills')
+  .description('Manage technical skills search paths')
+  .option('-l, --list', 'List skill search paths')
+  .option('-a, --add <path>', 'Add a skill search path')
+  .option('-r, --remove <path>', 'Remove a skill search path')
+  .action(async (options) => {
+    const config = new ConfigManager();
+    const skillsConfig = config.get('skills') || { paths: [] };
+    
+    if (options.add) {
+      if (!skillsConfig.paths.includes(options.add)) {
+        skillsConfig.paths.push(options.add);
+        config.set('skills', skillsConfig);
+        console.log(chalk.green(`✓ Added skill path: ${options.add}`));
+      }
+    } else if (options.remove) {
+      const initialLength = skillsConfig.paths.length;
+      skillsConfig.paths = skillsConfig.paths.filter((p: string) => p !== options.remove);
+      if (skillsConfig.paths.length < initialLength) {
+        config.set('skills', skillsConfig);
+        console.log(chalk.green(`✓ Removed skill path: ${options.remove}`));
+      }
+    } else {
+      console.log(chalk.bold('\n📚 Skill Search Paths\n'));
+      if (skillsConfig.paths.length === 0) {
+        console.log(chalk.gray('  No skill paths configured.'));
+      } else {
+        skillsConfig.paths.forEach((p: string) => {
+          console.log(`  ${chalk.white(p)}`);
+        });
+      }
+      console.log();
+    }
+  });
+
 // Config command - manage settings
 program
   .command('config')

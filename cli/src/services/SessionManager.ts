@@ -26,7 +26,7 @@ export interface SessionStats {
 
 export interface SessionMessage {
   role: 'system' | 'user' | 'assistant';
-  content: string;
+  content: string | any[];
   timestamp: string;
   tokens?: number;
   cost?: number;
@@ -164,7 +164,7 @@ export class SessionManager {
   /**
    * Add a message to the current session
    */
-  addMessage(role: 'system' | 'user' | 'assistant', content: string, tokens?: number, cost?: number): void {
+  addMessage(role: 'system' | 'user' | 'assistant', content: string | any[], tokens?: number, cost?: number): void {
     if (!this.currentSession) return;
 
     const message: SessionMessage = {

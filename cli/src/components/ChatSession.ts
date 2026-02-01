@@ -49,10 +49,15 @@ ENVIRONMENT:
 CORE CAPABILITIES:
 1. Contextual Awareness: You explore the environment deeply. Use \`list\` and \`glob\` frequently to discover project structure.
 2. Code Implementation: You implement new features, fix bugs, and refactor code using surgical edits.
-3. Environment Management: You can manage environments and install dependencies.
+3. Environment Management: You can manage environments and install dependencies. All synchronous \`shell\` commands run in a single persistent terminal session, preserving current working directory and environment variables across calls. For long-running processes (like dev servers), use \`shell\` with \`isBackground: true\`. If you need to observe a long-running process in a real, visible terminal window for manual oversight, use \`spawn_terminal\`.
 4. Toolsmithing: You can request new tools if your current set is insufficient.
 5. Task Tracking: You maintain a project-wide TODO list in \`AGENT_TODO.md\`.
 6. Web Research: You have access to unrestricted, world-class search tools (DuckDuckGo/Brave). Use \`search\` for general research and \`browse\` to extract content from specific URLs.
+7. Specialized Knowledge: You can access MCP (Model Context Protocol) servers for up-to-date documentation and specialized skills. Use \`mcp\` to query servers like 'context7' (for library docs) and 'langchain' (for LangChain info).
+8. Engineering Skills: Use the \`skill\` tool to discover and read expert engineering pattern libraries (e.g., 'openrouter-typescript-sdk', 'frontend-design').
+9. Terminal Control: For background processes, use \`shell_output\` to check progress and \`shell_kill\` to stop them. If a command fails and you missed the output, use \`shell_output\` with \`last: true\`.
+10. Tool Inventory: Use \`inventory\` to discover all available tools, including specialized toolkits (e.g., 'Virtual_Phone_Controller'). If you feel you are missing a capability, check the inventory first.
+11. Hardware & Mobile Interface: You can control virtual and physical devices via the \`Virtual_Phone_Controller\` toolkit. This provides "vision" (extracting screenshots and dumping UI hierarchy XML), "fingertip" control (tapping/swiping/click-by-text), "typing" (injecting text), and "system relay" (low-level ADB shell access). Screenshots are provided to you as direct image inputs, allowing you to "see" exactly what is on the device screen.
 
 TEST-DRIVEN DEVELOPMENT (TDD) MANDATE:
 - ALWAYS write a test (via \`write\` or \`edit\`) for any new feature or fix BEFORE implementing it. 
@@ -60,11 +65,19 @@ TEST-DRIVEN DEVELOPMENT (TDD) MANDATE:
 - DO NOT report task completion until you have verified your changes with at least one automated test.
 - Scaffold any project with tests from the start, regardless of the language or framework.
 
+KNOWLEDGE ACQUISITION:
+- **Up-to-date Docs**: When working with modern libraries (Next.js, Tailwind, MongoDB, etc.), ALWAYS check \`mcp\` action: "call" with server: "context7", toolName: "query-docs". It provides the latest API references and examples. (Example libraryIds: /vercel/next.js, /mongodb/docs).
+- **Expert Patterns**: Before starting a specific domain task (e.g., UI building, API integration), check \`skill\` action: "list" and "read" the relevant skill. These are curated by experts to ensure top-tier code quality.
+- **Mobile Vision & Control**: If a task requires interacting with a mobile app or device, immediately run \`inventory toolkit: "Virtual_Phone_Controller"\`. Use \`VisualInterface\` to "see" (screenshot/dump_hierarchy) and "act" (tap/swipe/tap_by_text) on the device. Dumping the hierarchy is often superior to screenshots for identifying button IDs and text segments. Use \`DeviceOrchestrator\` to manage its state.
+- **Toolkit Discovery**: If a task requires specific hardware or domain integration (e.g., "use the phone", "interact with the device"), ALWAYS run \`inventory\` to see if a specialized toolkit is already forged. Toolkits are collections of tools prefixed by their name (e.g., \`Virtual_Phone_Controller_...\`).
+- **Exploration First**: Before acting, always \`list\` the root and key directories. Never assume the presence of a file.
+
 PROJECT DISCIPLINE & EXPLORATION:
 - You are an expert Software Engineer. You work across ALL languages and domains.
-- **Exploration First**: Before acting, always \`list\` the root and key directories. Never assume the presence of a file.
 - **Systematic Progress**: Always call \`todo\` with \`action: "list"\` at the start of a session.
 - **Elite Standards**: Consult \`.agentforge/knowledge/\` for implementation patterns (Design, TypeScript, Systems).
+- **TOOL FAILURE RIGOR**: If a tool returns \`success: false\`, you MUST acknowledge the error explicitly. Do not ignore it or assume the operation succeeded anyway. If you are in the middle of a multi-step plan, stop and re-evaluate based on the error. PROCEEDING AS IF SUCCESSFUL WHEN A TOOL FAILED IS A CRITICAL VIOLATION.
+- **No Daydreaming**: Do not hallucinate tool outputs. When a tool provides a screenshot or hierarchy, analyze it carefully before your next move. If a tool fails to provide vision, you CANNOT "see" the device.
 - **Proactive Research**: Use the \`search\` tool at your own discretion to find best practices, library documentation, or solutions to complex errors. If the user provides a link, use \`browse\` to read it.
 - Use Language Agent Tree Search (LATS) logic: Plan -> Act -> Observe -> Refine.
 
@@ -87,6 +100,7 @@ To use a tool, respond with a JSON block like this:
   }
 }
 \`\`\`
+Note: This backtick format is the ONLY supported tool-calling format. Do not use XML-like tags, Llama-interleaved markers, or any other hidden tokens.
 
 To request a new tool or an entire TOOLKIT from the Toolsmith (user validation required):
 \`\`\`forge-request
@@ -114,7 +128,7 @@ export class ChatSession {
   private model: string;
   private sessionId: string;
   private stream: boolean;
-  private messages: Array<{ role: string; content: string }> = [];
+  private messages: Array<{ role: string; content: string | any[] }> = [];
   private toolResults: any[];
   private running: boolean;
   private credits: number = 0;
@@ -134,6 +148,7 @@ export class ChatSession {
   private contextSummary: string | null = null;
   private compactingContext: boolean = false;
   private permittedTools: Set<string> = new Set();
+  private pendingImage: string | null = null;
 
   constructor(options: any = {}) {
     this.config = options.config;
@@ -258,6 +273,33 @@ export class ChatSession {
     this.sessionManager.addMessage('system', finalPrompt);
   }
 
+  private async setupMCPServers(): Promise<void> {
+    const mcpConfig = this.config.get('mcp');
+    if (!mcpConfig || !mcpConfig.servers || !Array.isArray(mcpConfig.servers)) return;
+
+    const spinner = ora(chalk.gray('Connecting to MCP servers...')).start();
+    let connectedCount = 0;
+
+    for (const server of mcpConfig.servers) {
+      try {
+        await this.mcpClient.connect(server.id, server.url, server.name);
+        connectedCount++;
+      } catch (err) {
+        // Silently fail for individual servers, but log if verbose
+        if (this.config.get('cli.verboseErrors')) {
+          spinner.fail(`Failed to connect to MCP server ${server.name} (${server.id})`);
+          spinner.start();
+        }
+      }
+    }
+
+    if (connectedCount > 0) {
+      spinner.succeed(`Connected to ${connectedCount} MCP servers`);
+    } else {
+      spinner.stop();
+    }
+  }
+
   private resumeSession(sessionId: string): void {
     const session = this.sessionManager.loadSession(sessionId);
     if (session) {
@@ -266,9 +308,11 @@ export class ChatSession {
         content: m.content
       }));
       const summaryMsg = session.messages.find(
-        m => m.role === 'system' && m.content.startsWith('Conversation summary (memory):')
+        m => m.role === 'system' && 
+             typeof m.content === 'string' && 
+             m.content.startsWith('Conversation summary (memory):')
       );
-      if (summaryMsg) {
+      if (summaryMsg && typeof summaryMsg.content === 'string') {
         this.contextSummary = summaryMsg.content.replace(/^Conversation summary \(memory\):\n?/i, '').trim();
       }
       this.model = session.model;
@@ -288,6 +332,7 @@ export class ChatSession {
     // Set up graceful exit handler
     this.setupExitHandler();
     
+    await this.setupMCPServers();
     await this.loadCredits();
     
     // Create or load session
@@ -479,16 +524,15 @@ export class ChatSession {
       {
         type: 'autocomplete',
         name: 'userInput',
-        message: POINTER_ACTIVE + ' ',
+        message: chalk.blue('▶  '),
         prefix: '',
-        pageSize: 15,
+        pageSize: 10,
         suggestOnly: true,
         source: async (answers: any, input: string) => {
           input = input || '';
           const query = input.toLowerCase();
-          const choices: any[] = [];
-
-          // If starting with /, show command list
+          
+          // Command Completion - only shown when typing /
           if (input.startsWith('/')) {
             const matches = commands.filter(c => 
               `/${c.name}`.toLowerCase().startsWith(query) || 
@@ -502,27 +546,21 @@ export class ChatSession {
             }));
           }
 
-          // If empty, show common commands
-          if (!input) {
-            choices.push(new inquirer.Separator(chalk.gray('Available Commands (type /)')));
-            commands.slice(0, 10).forEach(c => {
-              choices.push({
-                name: `${chalk.green('/' + c.name).padEnd(25)} ${chalk.gray(c.description)}`,
-                value: `/${c.name}`,
-                short: `/${c.name}`
-              });
-            });
+          // Search History - only shown when typing and not a command
+          // and only if user has typed at least 2 chars to avoid "jarring" popups
+          if (input.length > 1) {
+            const matches = this.history
+              .filter(h => h.toLowerCase().includes(query))
+              .reverse()
+              .slice(0, 5);
+            
+            return matches;
           }
 
-          return choices;
+          return [];
         }
       }
     ]);
-
-    // Clear the line where inquirer shows the choice to avoid double text
-    if (process.stdout.isTTY) {
-      process.stdout.write('\x1B[1A\x1B[2K\x1B[1G'); // Move up, clear line, move to start
-    }
 
     return result.userInput;
   }
@@ -686,8 +724,17 @@ export class ChatSession {
     
     for (const msg of this.messages.slice(1)) {
       const role = msg.role === 'user' ? chalk.cyan('You') : chalk.green('Agent');
-      const content = msg.content.slice(0, 100) + (msg.content.length > 100 ? '...' : '');
-      console.log(`${role}: ${content}`);
+      let content = '';
+      if (Array.isArray(msg.content)) {
+        const textPart = msg.content.find((p: any) => p.type === 'text');
+        const hasImage = msg.content.some((p: any) => p.type === 'image_url');
+        content = (textPart?.text || '') + (hasImage ? chalk.yellow(' [IMAGE ATTACHED]') : '');
+      } else {
+        content = msg.content;
+      }
+      
+      const displayContent = content.slice(0, 100) + (content.length > 100 ? '...' : '');
+      console.log(`${role}: ${displayContent}`);
     }
     console.log();
   }
@@ -1223,46 +1270,59 @@ export class ChatSession {
     if (!text) return '';
     return text
       .replace(/```\s*(tool|forge-request)[\s\S]*?```/gi, '')
+      .replace(/<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/g, '')
+      .replace(/<\|tool_call_begin\|>[\s\S]*?<\|tool_call_end\|>/g, '')
+      .replace(/<\|tool_calls_section_begin\|>/g, '')
+      .replace(/<\|tool_calls_section_end\|>/g, '')
       .trim();
   }
 
   private consumeVisibleFromBuffer(buffer: string): { visible: string; remaining: string } {
     if (!buffer) return { visible: '', remaining: '' };
 
-    let output = '';
+    let output = buffer;
+
+    // Suppress Llama/Interleaved tool tags completely
+    output = output.replace(/<\|tool_calls_section_begin\|>[\s\S]*?<\|tool_calls_section_end\|>/g, '');
+    output = output.replace(/<\|tool_call_begin\|>[\s\S]*?<\|tool_call_end\|>/g, '');
+    output = output.replace(/<\|tool_calls_section_begin\|>/g, '');
+    output = output.replace(/<\|tool_calls_section_end\|>/g, '');
+
+    // Existing backtick fence suppression logic
+    let visibleResult = '';
     let i = 0;
 
-    while (i < buffer.length) {
-      const fenceIdx = buffer.indexOf('```', i);
+    while (i < output.length) {
+      const fenceIdx = output.indexOf('```', i);
       if (fenceIdx === -1) {
-        output += buffer.slice(i);
-        return { visible: output, remaining: '' };
+        visibleResult += output.slice(i);
+        return { visible: visibleResult, remaining: '' };
       }
 
-      output += buffer.slice(i, fenceIdx);
-      const lineEnd = buffer.indexOf('\n', fenceIdx);
+      visibleResult += output.slice(i, fenceIdx);
+      const lineEnd = output.indexOf('\n', fenceIdx);
       if (lineEnd === -1) {
-        return { visible: output, remaining: buffer.slice(fenceIdx) };
+        return { visible: visibleResult, remaining: output.slice(fenceIdx) };
       }
 
-      const fenceLine = buffer.slice(fenceIdx, lineEnd).trim();
+      const fenceLine = output.slice(fenceIdx, lineEnd).trim();
       const isToolFence = /^```\s*(tool|forge-request)\s*$/i.test(fenceLine);
 
       if (!isToolFence) {
-        output += buffer.slice(fenceIdx, lineEnd + 1);
+        visibleResult += output.slice(fenceIdx, lineEnd + 1);
         i = lineEnd + 1;
         continue;
       }
 
-      const endIdx = buffer.indexOf('```', lineEnd + 1);
+      const endIdx = output.indexOf('```', lineEnd + 1);
       if (endIdx === -1) {
-        return { visible: output, remaining: buffer.slice(fenceIdx) };
+        return { visible: visibleResult, remaining: output.slice(fenceIdx) };
       }
 
       i = endIdx + 3;
     }
 
-    return { visible: output, remaining: '' };
+    return { visible: visibleResult, remaining: '' };
   }
 
   private filterToolChunks(chunk: string, state: { inToolBlock: boolean; remainder: string }): string {
@@ -1456,27 +1516,25 @@ export class ChatSession {
     let text = buffer;
     let consumed = false;
 
-    const startFenceRegex = /```\s*(tool|forge-request)\b/i;
+    // Support for multiple tool block formats
+    // 1. Standard Markdown: ```tool { ... } ```
+    // 2. Llama Interleaved: <|tool_call_begin|> functions.name:id <|tool_call_argument_begin|> {args} <|tool_call_end|>
 
+    // Markdown Format
+    const markdownRegex = /```\s*(tool|forge-request)\b/i;
     while (true) {
-      const match = startFenceRegex.exec(text);
-      if (!match) {
-        return { remaining: text.length > 4000 ? text.slice(-1000) : text, consumed };
-      }
+      const match = markdownRegex.exec(text);
+      if (!match) break;
 
       const startIdx = match.index;
       const afterStart = text.slice(startIdx);
       const lineEnd = afterStart.indexOf('\n');
-      if (lineEnd === -1) {
-        return { remaining: text, consumed };
-      }
+      if (lineEnd === -1) break;
 
       const blockType = match[1].toLowerCase();
       const contentStart = startIdx + lineEnd + 1;
       const endIdx = text.indexOf('```', contentStart);
-      if (endIdx === -1) {
-        return { remaining: text, consumed };
-      }
+      if (endIdx === -1) break;
 
       const raw = text.slice(contentStart, endIdx).trim();
       if (raw) {
@@ -1487,13 +1545,33 @@ export class ChatSession {
             executed.add(signature);
             this.enqueueToolExecution({ type: blockType === 'tool' ? 'tool' : 'forge', payload, raw });
           }
-        } catch (error: any) {
-          // Silently ignore parsing errors to keep the interface clean
-        }
+        } catch (error: any) {}
       }
-
       text = text.slice(endIdx + 3);
       consumed = true;
+    }
+
+    // Llama Interleaved Format
+    const llamaRegex = /<\|tool_call_begin\|>\s*functions\.([^:]+):[^\s]*\s*<\|tool_call_argument_begin\|>([\s\S]*?)<\|tool_call_end\|>/g;
+    let llamaMatch;
+    while ((llamaMatch = llamaRegex.exec(text)) !== null) {
+      const name = llamaMatch[1];
+      const argsRaw = llamaMatch[2].trim();
+      try {
+        const args = JSON.parse(argsRaw);
+        const payload = { name, args };
+        const signature = this.toolSignature(payload);
+        if (signature && !executed.has(signature)) {
+          executed.add(signature);
+          this.enqueueToolExecution({ type: 'tool', payload, raw: llamaMatch[0] });
+        }
+      } catch (error: any) {}
+      consumed = true;
+    }
+
+    // Clean up if the buffer gets way too huge without finding anything
+    if (text.length > 8000 && !consumed) {
+      return { remaining: text.slice(-2000), consumed: false };
     }
 
     return { remaining: text, consumed };
@@ -1524,9 +1602,23 @@ export class ChatSession {
     };
   }
 
-  private formatMessagesForSummary(messages: Array<{ role: string; content: string }>): string {
+  private formatMessagesForSummary(messages: Array<{ role: string; content: string | any[] }>): string {
     return messages
-      .map((m, i) => `[#${i + 1} ${m.role.toUpperCase()}]\n${m.content}`)
+      .map((m, i) => {
+        let text = '';
+        if (Array.isArray(m.content)) {
+          text = m.content
+            .filter((p: any) => p.type === 'text')
+            .map((p: any) => p.text)
+            .join('\n');
+          if (m.content.some((p: any) => p.type === 'image_url')) {
+            text += '\n[IMAGE ATTACHED]';
+          }
+        } else {
+          text = m.content;
+        }
+        return `[#${i + 1} ${m.role.toUpperCase()}]\n${text}`;
+      })
       .join('\n\n');
   }
 
@@ -1584,8 +1676,25 @@ export class ChatSession {
   
   async sendMessage(content: string): Promise<void> {
     if (content) {
-      this.messages.push({ role: 'user', content });
-      this.sessionManager.addMessage('user', content);
+      // Create message with current multimodal state using latest OpenRouter SDK callModel format
+      const userMsg: any = {
+        role: 'user',
+        content: this.pendingImage 
+          ? [
+              { type: 'input_text', text: content },
+              { 
+                type: 'input_image', 
+                imageUrl: this.pendingImage
+              }
+            ]
+          : content
+      };
+
+      this.messages.push(userMsg);
+      this.sessionManager.addMessage('user', userMsg.content);
+      
+      // Clear pending image after use
+      this.pendingImage = null;
     }
     
     await this.maybeCompactContext();
@@ -1611,21 +1720,69 @@ export class ChatSession {
         const reasoningConfig = this.config.get('openrouter.reasoning');
         const reasoningOptions = reasoningConfig?.enabled ? { reasoning: reasoningConfig } : {};
 
-        const result = await this.client.streamOpenRouter(
-          this.messages,
-          (chunk: string) => {
-            buffer += chunk;
-            streamState.rawBuffer += chunk;
-            const extracted = this.extractToolBlocksFromBuffer(streamState.rawBuffer, executedToolBlocks);
-            streamState.rawBuffer = extracted.remaining;
-            const { visible, remaining } = this.consumeVisibleFromBuffer(buffer);
-            if (visible) {
-              process.stdout.write(visible);
-            }
-            buffer = remaining;
-          },
-          { model: this.model, includeReasoningInContent: true, ...reasoningOptions }
-        );
+        let result: any;
+        try {
+          result = await this.client.streamOpenRouter(
+            this.messages,
+            (chunk: string) => {
+              buffer += chunk;
+              streamState.rawBuffer += chunk;
+              const extracted = this.extractToolBlocksFromBuffer(streamState.rawBuffer, executedToolBlocks);
+              streamState.rawBuffer = extracted.remaining;
+              const { visible, remaining } = this.consumeVisibleFromBuffer(buffer);
+              if (visible) {
+                process.stdout.write(visible);
+              }
+              buffer = remaining;
+            },
+            { model: this.model, includeReasoningInContent: true, ...reasoningOptions }
+          );
+        } catch (error: any) {
+          spinner.stop();
+          
+          // Detect validation errors (Zod, OpenRouter side, etc.)
+          const isValidationError = /validation|input|role|content|invalid/i.test(error.message);
+          
+          if (isValidationError) {
+            console.log(chalk.yellow('\n  ⚠ Multi-modal input error. Retrying with text-only...'));
+            
+            // Clean ALL messages in the current session state to ensure they stay clean
+            this.messages = this.messages.map(m => {
+              if (Array.isArray(m.content)) {
+                return {
+                  ...m,
+                  content: m.content
+                    .filter((p: any) => p.type === 'text')
+                    .map((p: any) => p.text)
+                    .join('\n')
+                };
+              }
+              return m;
+            });
+            
+            spinner.start(chalk.gray('Retrying (text-only)...'));
+            
+            result = await this.client.streamOpenRouter(
+              this.messages,
+              (chunk: string) => {
+                buffer += chunk;
+                streamState.rawBuffer += chunk;
+                const extracted = this.extractToolBlocksFromBuffer(streamState.rawBuffer, executedToolBlocks);
+                streamState.rawBuffer = extracted.remaining;
+                const { visible, remaining } = this.consumeVisibleFromBuffer(buffer);
+                if (visible) {
+                   process.stdout.write(visible);
+                }
+                buffer = remaining;
+              },
+              { model: this.model, ...reasoningOptions }
+            );
+            spinner.stop();
+          } else {
+            displayError('Agent response error', error.message);
+            throw error;
+          }
+        }
         
         response = result.content;
         usageData = result.usage;
@@ -1659,10 +1816,44 @@ export class ChatSession {
         const reasoningConfig = this.config.get('openrouter.reasoning');
         const reasoningOptions = reasoningConfig?.enabled ? { reasoning: reasoningConfig } : {};
 
-        const result: any = await this.client.openRouterComplete(this.messages, {
-          model: this.model,
-          ...reasoningOptions
-        });
+        let result: any;
+        try {
+          result = await this.client.openRouterComplete(this.messages, {
+            model: this.model,
+            ...reasoningOptions
+          });
+        } catch (error: any) {
+          spinner.stop();
+          
+          const isValidationError = /validation|input|role|content|invalid/i.test(error.message);
+          
+          if (isValidationError) {
+            console.log(chalk.yellow('\n  ⚠ Multi-modal input error. Retrying with text-only...'));
+            
+            this.messages = this.messages.map(m => {
+              if (Array.isArray(m.content)) {
+                return {
+                  ...m,
+                  content: m.content
+                    .filter((p: any) => p.type === 'text')
+                    .map((p: any) => p.text)
+                    .join('\n')
+                };
+              }
+              return m;
+            });
+            
+            spinner.start(chalk.gray('Retrying (text-only)...'));
+            result = await this.client.openRouterComplete(this.messages, {
+              model: this.model,
+              ...reasoningOptions
+            });
+            spinner.stop();
+          } else {
+            displayError('Agent response error', error.message);
+            throw error;
+          }
+        }
         
         spinner.stop();
         response = result.choices?.[0]?.message?.content || '';
@@ -1745,28 +1936,39 @@ export class ChatSession {
   }
   
   async processToolCalls(response: string, executed?: Set<string>): Promise<void> {
-    // Look for tool blocks
+    // Standard Markdown tool blocks
     const toolPattern = /```\s*tool\s*[\r\n]+([\s\S]*?)[\r\n]+```/gi;
     const forgeRequestPattern = /```\s*forge-request\s*[\r\n]+([\s\S]*?)[\r\n]+```/gi;
     
+    // Llama interleaved tool calls
+    const llamaPattern = /<\|tool_call_begin\|>\s*functions\.([^:]+):[^\s]*\s*<\|tool_call_argument_begin\|>([\s\S]*?)<\|tool_call_end\|>/gi;
+
     let match: RegExpExecArray | null;
     
-    // Process tool calls
+    // Process markdown tool calls
     while ((match = toolPattern.exec(response)) !== null) {
       try {
         const raw = match[1].trim();
         const toolCall = JSON.parse(raw);
         const signature = this.toolSignature(toolCall);
-        if (executed && signature && executed.has(signature)) {
-          continue;
-        }
-        if (executed && signature) {
-          executed.add(signature);
-        }
+        if (executed && signature && executed.has(signature)) continue;
+        if (executed && signature) executed.add(signature);
         this.enqueueToolExecution({ type: 'tool', payload: toolCall, raw });
-      } catch (e: any) {
-        // Silently ignore parsing errors
-      }
+      } catch (e: any) {}
+    }
+
+    // Process Llama tool calls
+    while ((match = llamaPattern.exec(response)) !== null) {
+      try {
+        const name = match[1];
+        const argsRaw = match[2].trim();
+        const args = JSON.parse(argsRaw);
+        const toolCall = { name, args };
+        const signature = this.toolSignature(toolCall);
+        if (executed && signature && executed.has(signature)) continue;
+        if (executed && signature) executed.add(signature);
+        this.enqueueToolExecution({ type: 'tool', payload: toolCall, raw: match[0] });
+      } catch (e: any) {}
     }
     
     // Process forge requests with user approval
@@ -1886,6 +2088,15 @@ export class ChatSession {
             case 'shell':
               result = await tool.execute(args.command, args);
               break;
+            case 'shell_kill':
+              result = await tool.execute(args.procId);
+              break;
+            case 'shell_output':
+              result = await tool.execute(args);
+              break;
+            case 'inventory':
+              result = await tool.execute(args);
+              break;
             case 'env':
               result = await tool.execute(args.action, args.envPath, args);
               break;
@@ -1898,6 +2109,12 @@ export class ChatSession {
             case 'web':
               result = await tool.execute(args.url, args);
               break;
+            case 'search':
+              result = await tool.execute(args.query, args);
+              break;
+            case 'browse':
+              result = await tool.execute(args.url, args);
+              break;
             case 'todo':
               result = await tool.execute(args.action, args);
               break;
@@ -1907,16 +2124,19 @@ export class ChatSession {
             case 'mcp':
               result = await tool.execute(args.action, args, this.mcpClient);
               break;
+            case 'skill':
+              result = await tool.execute(args.action, { ...args, paths: this.config.get('skills.paths') });
+              break;
             case 'forge-audit':
               const forge = new ForgeUI({ config: this.config });
               await forge.audit();
               result = { success: true, summary: "Toolset audit and improvement session completed." };
               break;
             default:
-              // For tools not in the switch, check if they are forged or modern (take object as first arg)
-              // or if they follow the legacy (arg1, options) pattern.
+              // For tools not in the switch, check if they are forged, toolkit-based, or modern.
               // Most forged tools and newer tools take a single object.
-              if ((tool as any).source === 'forged' || (tool as any).source === 'forged-core' || name === 'git' || name === 'test' || name === 'refactor') {
+              const source = (tool as any).source || '';
+              if (source === 'forged' || source === 'forged-core' || source.includes('_') || name === 'git' || name === 'test' || name === 'refactor') {
                 result = await tool.execute(args);
               } else {
                 // Legacy fallback: try to find a primary argument based on common names
@@ -1961,25 +2181,45 @@ export class ChatSession {
       
       // Add tool result to conversation for context
       if (result && result.success === true) {
-        let content = `[Tool ${name} succeeded: ${result.summary}]`;
+        let textContent = `[Tool ${name} succeeded: ${result.summary}]`;
         
         // Include output data if available and not too large
         if (result.data) {
-          const normalizedData = name === 'shell'
-            ? { ...result.data, output: result.data.fullOutput }
-            : result.data;
+          const normalizedData = { ...result.data };
+          
+          // Remove potential heavy data from text dump to avoid token waste
+          // since we'll handle screenshot specifically for vision
+          if (normalizedData.screenshot) delete normalizedData.screenshot;
+          
           const dataStr = JSON.stringify(normalizedData, null, 2);
-          if (dataStr.length < 10000) {
-            content += `\nOutput:\n${dataStr}`;
+          const limit = (name === 'inventory' || name === 'mcp' || name === 'skill') ? 30000 : 15000;
+          
+          if (dataStr.length < limit) {
+            textContent += `\nOutput:\n${dataStr}`;
           } else {
-            content += `\nOutput:\n${dataStr.slice(0, 10000)}... (truncated)`;
+            textContent += `\nOutput:\n${dataStr.slice(0, limit)}... (truncated)`;
           }
         }
         
-        this.messages.push({
-          role: 'user',
-          content
-        });
+        // Multi-modal message construction using latest OpenRouter SDK callModel format
+        if (result.data && result.data.screenshot) {
+          const imageUrl = `data:image/png;base64,${result.data.screenshot}`;
+          this.messages.push({
+            role: 'user',
+            content: [
+              { type: 'input_text', text: textContent },
+              { 
+                type: 'input_image', 
+                imageUrl: imageUrl
+              }
+            ]
+          } as any);
+        } else {
+          this.messages.push({
+            role: 'user',
+            content: textContent
+          });
+        }
       } else if (result && result.success === false) {
         const usage = this.formatToolUsage(name);
         const explanation = result.summary || 'Tool failed.';
@@ -2013,7 +2253,7 @@ export class ChatSession {
       });
     }
   }
-  
+
   async handleForgeRequest(request: any): Promise<void> {
     const isToolkit = Array.isArray(request.tools) && request.tools.length > 1;
     

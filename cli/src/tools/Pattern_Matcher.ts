@@ -33,7 +33,12 @@ export async function Pattern_Matcher(args: { query: string }, options: any = {}
       const firstUserMsg = session.messages.find(m => m.role === 'user');
       if (!firstUserMsg) continue;
 
-      const taskContent = firstUserMsg.content;
+      const taskContent = typeof firstUserMsg.content === 'string' 
+        ? firstUserMsg.content 
+        : (Array.isArray(firstUserMsg.content) 
+            ? firstUserMsg.content.find((p: any) => p.type === 'text')?.text || '' 
+            : '');
+            
       const taskLower = taskContent.toLowerCase();
       
       // Calculate relevance
@@ -55,10 +60,16 @@ export async function Pattern_Matcher(args: { query: string }, options: any = {}
       if (relevance > 0.2) {
         // Find if there was a successful outcome
         // Look for "success" or "✓" in assistant messages or tool results
-        const successMatch = session.messages.some(m => 
-          m.role === 'assistant' && 
-          (m.content.includes('✓') || m.content.toLowerCase().includes('success') || m.content.toLowerCase().includes('fixed'))
-        );
+        const successMatch = session.messages.some(m => {
+          const content = typeof m.content === 'string' 
+            ? m.content 
+            : (Array.isArray(m.content) 
+                ? m.content.find((p: any) => p.type === 'text')?.text || '' 
+                : '');
+                
+          return m.role === 'assistant' && 
+            (content.includes('✓') || content.toLowerCase().includes('success') || content.toLowerCase().includes('fixed'));
+        });
 
         matches.push({
           sessionId: session.id,

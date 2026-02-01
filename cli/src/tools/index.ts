@@ -5,7 +5,7 @@
  * Each tool returns minimal output (1-2 lines).
  */
 
-import { exec, spawn } from 'child_process';
+import { exec, spawn, execSync } from 'child_process';
 import { promisify } from 'util';
 import { readFile, writeFile, access, mkdir, readdir, stat } from 'fs/promises';
 import { basename, dirname, join, relative, resolve } from 'path';
@@ -14,10 +14,125 @@ import chalk from 'chalk';
 import fetch from 'node-fetch';
 import { fileURLToPath } from 'url';
 import { search, browse } from './search';
+import VisualInterface from './Virtual_Phone_Controller/VisualInterface';
+import DeviceOrchestrator from './Virtual_Phone_Controller/DeviceOrchestrator';
+import SystemRelay from './Virtual_Phone_Controller/SystemRelay';
+import AnalyzeFailure from './Autonomous_Memory_Suite/AnalyzeFailure';
+import DecomposeObjective from './Autonomous_Memory_Suite/DecomposeObjective';
+import PersistTrace from './Autonomous_Memory_Suite/PersistTrace';
+import UpdateHeuristics from './Autonomous_Memory_Suite/UpdateHeuristics';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const execAsync = promisify(exec);
+
+// Track active background processes
+interface ActiveProcess {
+  id: string;
+  process: any;
+  output: string[];
+  command: string;
+  startedAt: string;
+}
+const activeProcesses = new Map<string, ActiveProcess>();
+let lastCommandOutput = '';
+
+/**
+ * Spawns a dedicated external terminal window for a command
+ */
+export async function spawnTerminal(options: any = {}): Promise<ToolResult> {
+  const { command = '', cwd = '.', title = 'AgentForge Worker' } = options;
+  const absCwd = resolve(cwd);
+
+  try {
+    if (process.platform === 'win32') {
+      // Windows: use 'start' to open a new cmd or pwsh window
+      const shell = 'pwsh.exe';
+      const args = [
+        'start', shell, '-NoExit', '-Command', 
+        `$Host.UI.RawUI.WindowTitle = "${title}"; cd "${absCwd}"; ${command}`
+      ];
+      spawn('powershell.exe', ['-Command', args.join(' ')], { detached: true, stdio: 'ignore' }).unref();
+    } else if (process.platform === 'darwin') {
+      // macOS: use AppleScript to open Terminal
+      const script = `tell application "Terminal" to do script "cd ${absCwd} && ${command}"`;
+      spawn('osascript', ['-e', script], { detached: true, stdio: 'ignore' }).unref();
+    } else {
+      // Linux: try x-terminal-emulator or gnome-terminal
+      spawn('x-terminal-emulator', ['-e', `bash -c "cd ${absCwd} && ${command}; exec bash"`], { detached: true, stdio: 'ignore' }).unref();
+    }
+
+    return new ToolResult(true, `Opened a new terminal window at ${absCwd}`, { title, cwd: absCwd });
+  } catch (error: any) {
+    return new ToolResult(false, `Failed to spawn terminal: ${error.message}`);
+  }
+}
+
+// Persistent Shell State
+let persistentProcess: any = null;
+let persistentOutput = '';
+let persistentBusy = false;
+
+/**
+ * Executes a command in a persistent shell session
+ */
+async function runInPersistentShell(command: string, cwd: string, timeout: number): Promise<{ output: string, exitCode: number }> {
+  if (persistentBusy) {
+    throw new Error('Persistent shell is currently busy. Wait for the previous command to finish.');
+  }
+  
+  persistentBusy = true;
+  
+  try {
+    if (!persistentProcess || persistentProcess.killed) {
+      const shellCmd = process.platform === 'win32' ? 'pwsh.exe' : 'bash';
+      const shellArgs = process.platform === 'win32' ? ['-NoLogo', '-NoExit', '-Command', '-'] : ['-i'];
+      
+      persistentProcess = spawn(shellCmd, shellArgs, {
+        cwd: resolve(cwd),
+        env: { ...process.env, COLUMNS: '120', LINES: '40', TERM: 'xterm' },
+        stdio: ['pipe', 'pipe', 'pipe']
+      });
+
+      persistentProcess.stdout.on('data', (data: Buffer) => { persistentOutput += data.toString(); });
+      persistentProcess.stderr.on('data', (data: Buffer) => { persistentOutput += data.toString(); });
+      
+      // Initial wait to let shell settle
+      await new Promise(r => setTimeout(r, 500));
+    } else {
+      // Update CWD if it changed
+      persistentProcess.stdin.write(`cd "${resolve(cwd).replace(/\\/g, '/')}"\n`);
+    }
+
+    const marker = `__FORGE_TRANSACTION_${Math.random().toString(36).slice(2, 8)}__`;
+    persistentOutput = '';
+    
+    // Command execution with delimiter and exit code capture
+    const fullCommand = process.platform === 'win32'
+      ? `${command}\nif ($?) { Write-Host "${marker}:0" } else { Write-Host "${marker}:$LASTEXITCODE" }\n`
+      : `${command}\nif [ $? -eq 0 ]; then echo "${marker}:0"; else echo "${marker}:$?"; fi\n`;
+
+    persistentProcess.stdin.write(fullCommand);
+
+    return new Promise((resolve) => {
+      const start = Date.now();
+      const interval = setInterval(() => {
+        if (persistentOutput.includes(marker)) {
+          clearInterval(interval);
+          const parts = persistentOutput.split(marker);
+          const output = parts[0].trim();
+          const exitCode = parseInt(parts[1].split(':')[1] || '0', 10);
+          resolve({ output, exitCode: isNaN(exitCode) ? 0 : exitCode });
+        } else if (Date.now() - start > timeout) {
+          clearInterval(interval);
+          resolve({ output: persistentOutput + '\n[Command timed out]', exitCode: -1 });
+        }
+      }, 100);
+    });
+  } finally {
+    persistentBusy = false;
+  }
+}
 
 /**
  * Base class for tool results
@@ -237,7 +352,8 @@ export async function shell(command: string, options: any = {}): Promise<ToolRes
   const {
     cwd = process.cwd(),
     timeout = 30000,
-    showOutput = false
+    showOutput = false,
+    isBackground = false
   } = options;
   
   try {
@@ -262,38 +378,189 @@ export async function shell(command: string, options: any = {}): Promise<ToolRes
       }
     }
 
-    const { stdout, stderr } = await execAsync(finalCommand, {
-      cwd: resolve(cwd),
-      timeout,
-      maxBuffer: 10 * 1024 * 1024  // 10MB
-    });
+    if (isBackground) {
+      const procId = `proc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const shellCmd = process.platform === 'win32' ? 'cmd.exe' : 'sh';
+      const shellArgs = process.platform === 'win32' ? ['/c', finalCommand] : ['-c', finalCommand];
+
+      const child = spawn(shellCmd, shellArgs, {
+        cwd: resolve(cwd),
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+
+      const entry: ActiveProcess = {
+        id: procId,
+        process: child,
+        output: [],
+        command,
+        startedAt: new Date().toISOString()
+      };
+      activeProcesses.set(procId, entry);
+
+      child.stdout?.on('data', (data) => entry.output.push(data.toString()));
+      child.stderr?.on('data', (data) => entry.output.push(data.toString()));
+      
+      child.on('close', (code) => {
+        // Keep in map but mark as finished
+        (entry as any).exitCode = code;
+        (entry as any).finishedAt = new Date().toISOString();
+      });
+
+      return new ToolResult(true, 
+        `Started background process ${chalk.cyan(procId)}: ${chalk.bold(command.slice(0, 30))}`,
+        { procId, command }
+      );
+    }
+
+    const { output, exitCode } = await runInPersistentShell(finalCommand, cwd, timeout);
     
-    const output = stdout + stderr;
+    lastCommandOutput = output; 
     const lines = output.trim().split('\n').length;
     
-    return new ToolResult(true,
-      `${chalk.gray('$')} ${chalk.bold(command.slice(0, 50))}${command.length > 50 ? '...' : ''} → ${chalk.green('Exit 0')}`,
-      { 
-        command, 
-        exitCode: 0, 
-        output: showOutput ? output : `(${lines} lines)`,
-        fullOutput: output,
-        lines
-      }
-    );
+    if (exitCode === 0) {
+      return new ToolResult(true,
+        `${chalk.gray('$')} ${chalk.bold(command.slice(0, 50))}${command.length > 50 ? '...' : ''} → ${chalk.green('Exit 0')}`,
+        { 
+          command, 
+          exitCode: 0, 
+          output: showOutput ? output : `(${lines} lines)`,
+          fullOutput: output,
+          lines
+        }
+      );
+    } else {
+      return new ToolResult(false,
+        `${chalk.gray('$')} ${chalk.bold(command.slice(0, 50))} → ${chalk.red(`Exit ${exitCode}`)}`,
+        { 
+          command, 
+          exitCode, 
+          error: exitCode === -1 ? 'Command timed out' : `Command failed with exit code ${exitCode}`,
+          output: output.slice(-2000),
+          fullOutput: output
+        }
+      );
+    }
   } catch (error: any) {
     const exitCode = error.code || 1;
     return new ToolResult(false,
-      `${chalk.gray('$')} ${chalk.bold(command.slice(0, 50))} → ${chalk.red(`Exit ${exitCode}`)}`,
-      { 
-        command, 
-        exitCode, 
-        error: error.message,
-        stderr: error.stderr,
-        fullOutput: `${error.stdout || ''}${error.stderr || ''}`
-      }
+      `Shell execution failed: ${error.message}`,
+      { command, exitCode, error: error.message }
     );
   }
+}
+
+/**
+ * Kill a background process
+ */
+export async function shellKill(procId: string): Promise<ToolResult> {
+  const entry = activeProcesses.get(procId);
+  if (!entry) return new ToolResult(false, `Process not found: ${procId}`);
+
+  try {
+    if (process.platform === 'win32') {
+      execSync(`taskkill /pid ${entry.process.pid} /T /F`).toString();
+    } else {
+      process.kill(-entry.process.pid); // Kill process group
+    }
+    activeProcesses.delete(procId);
+    return new ToolResult(true, `Killed process ${chalk.cyan(procId)} (${entry.command})`);
+  } catch (error: any) {
+    return new ToolResult(false, `Failed to kill process: ${error.message}`);
+  }
+}
+
+/**
+ * Inventory Tool - Get detailed information about all available tools and toolkits
+ */
+export async function inventoryTool(options: any = {}): Promise<ToolResult> {
+  const { query, toolkit } = options;
+  
+  const allTools = { ...staticTools, ...dynamicTools };
+  const categories: Record<string, any[]> = {
+    'built-in': [],
+    'forged-core': [],
+    'forged': [],
+    'mcp': []
+  };
+
+  // Group tools
+  for (const [name, tool] of Object.entries(allTools)) {
+    const source = (tool as any).source || 'built-in';
+    
+    // Toolkit name is everything before the LAST underscore, or the source if no underscore
+    let category = source;
+    if (name.includes('_')) {
+      const lastUnderscore = name.lastIndexOf('_');
+      const potentialToolkit = name.substring(0, lastUnderscore);
+      // If the potential toolkit is a known directory or source, use it
+      category = potentialToolkit;
+    }
+
+    if (!categories[category]) categories[category] = [];
+    
+    const info = {
+      name,
+      description: (tool as any).description,
+      parameters: (tool as any).parameters || {}
+    };
+
+    if (query) {
+      const searchStr = `${name} ${(tool as any).description}`.toLowerCase();
+      if (!searchStr.includes(query.toLowerCase())) continue;
+    }
+
+    if (toolkit && category !== toolkit) continue;
+
+    categories[category].push(info);
+  }
+
+  // Filter out empty categories
+  const result: Record<string, any[]> = {};
+  for (const [cat, tools] of Object.entries(categories)) {
+    if (tools.length > 0) result[cat] = tools;
+  }
+
+  // Fallback: If result is empty, something is wrong with categorization
+  if (Object.keys(result).length === 0 && Object.keys(allTools).length > 0) {
+    result['all-tools'] = Object.entries(allTools).map(([name, tool]) => ({
+      name,
+      description: (tool as any).description,
+      parameters: (tool as any).parameters || {}
+    }));
+  }
+
+  const summary = toolkit 
+    ? `Toolkit "${toolkit}" contains ${result[toolkit]?.length || 0} tools`
+    : `Collected inventory of ${Object.keys(allTools).length} available tools across ${Object.keys(result).length} categories: ${Object.keys(result).join(', ')}`;
+
+  return new ToolResult(true, summary, { inventory: result });
+}
+
+/**
+ * Get output of a background process or last command
+ */
+export async function shellOutput(options: any = {}): Promise<ToolResult> {
+  const { procId, last = false } = options;
+
+  if (last) {
+    return new ToolResult(true, `Retrieved last command output (${lastCommandOutput.length} characters)`, {
+      output: lastCommandOutput.slice(-5000) // Return last 5KB
+    });
+  }
+
+  if (!procId) return new ToolResult(false, 'Expected procId or last: true');
+
+  const entry = activeProcesses.get(procId);
+  if (!entry) return new ToolResult(false, `Process not found: ${procId}`);
+
+  const output = entry.output.join('');
+  return new ToolResult(true, `Retrieved output for process ${chalk.cyan(procId)}`, {
+    command: entry.command,
+    output: output.slice(-5000), // Return last 5KB
+    isFinished: (entry as any).finishedAt !== undefined,
+    exitCode: (entry as any).exitCode
+  });
 }
 
 /**
@@ -476,7 +743,7 @@ export async function checkTool(path: string = '.', options: any = {}): Promise<
  * Todo Tool - Manage project task list
  */
 export async function todoTool(action: string, options: any = {}): Promise<ToolResult> {
-  const { task = '', id = null, status = 'pending' } = options;
+  const { task = '', id = null, status = 'pending', items = [] } = options;
   const todoPath = resolve('AGENT_TODO.md');
   
   try {
@@ -486,29 +753,73 @@ export async function todoTool(action: string, options: any = {}): Promise<ToolR
     } catch {
       content = '# 📋 Project TODO List\n\n_Keep track of tasks and progress_\n\n';
     }
+
+    let lines = content.split('\n');
     
-    if (action === 'add' && task) {
-      content += `- [ ] ${task}\n`;
-    } else if (action === 'update' && id !== null) {
-      const lines = content.split('\n');
+    const getTasks = () => {
+      const taskList: { id: number; title: string; completed: boolean; lineIndex: number }[] = [];
       let currentId = 0;
       for (let i = 0; i < lines.length; i++) {
-        if (lines[i].trim().startsWith('- [')) {
-          if (currentId === id) {
-            const sym = status === 'completed' ? 'x' : ' ';
-            lines[i] = lines[i].replace(/\[[ xX]?\]/, `[${sym}]`);
-            break;
-          }
-          currentId++;
+        const trimmedLine = lines[i].trim();
+        if (trimmedLine.startsWith('- [') || trimmedLine.startsWith('* [') || /^\[[ xX]?\]/.test(trimmedLine)) {
+          const completed = /\[[xX]\]/.test(trimmedLine);
+          const title = trimmedLine.replace(/^[-* ]?\[[ xX]?\]/, '').trim();
+          taskList.push({ id: currentId++, title, completed, lineIndex: i });
         }
       }
-      content = lines.join('\n');
-    } else if (action === 'list') {
-      return new ToolResult(true, 'TODO list retrieved', { content });
+      return taskList;
+    };
+
+    if (action === 'add') {
+      const tasksToAdd = items.length > 0 ? items.map((it: any) => typeof it === 'string' ? it : it.task) : [task];
+      for (const t of tasksToAdd) {
+        if (t) {
+          const newTask = t.trim();
+          if (!lines.some(l => l.includes(newTask))) {
+            lines.push(`- [ ] ${newTask}`);
+          }
+        }
+      }
+    } else if (action === 'update' || action === 'complete') {
+      const updates = items.length > 0 ? items : (id !== null ? [{ id, status: action === 'complete' ? 'completed' : status }] : []);
+      const currentTasks = getTasks();
+      
+      for (const update of updates) {
+        const targetTask = currentTasks.find(t => t.id === update.id);
+        if (targetTask) {
+          const newStatus = action === 'complete' ? 'completed' : update.status;
+          const sym = newStatus === 'completed' ? 'x' : ' ';
+          lines[targetTask.lineIndex] = lines[targetTask.lineIndex].replace(/\[[ xX]?\]/, `[${sym}]`);
+          if (update.task) {
+             lines[targetTask.lineIndex] = lines[targetTask.lineIndex].replace(targetTask.title, update.task);
+          }
+        }
+      }
+    } else if (action === 'delete') {
+      const idsToDelete = items.length > 0 ? items.map((it: any) => typeof it === 'number' ? it : it.id) : (id !== null ? [id] : []);
+      const currentTasks = getTasks();
+      const lineIndicesToDelete = idsToDelete.map((id: any) => currentTasks.find(t => t.id === id)?.lineIndex).filter((idx: number | undefined) => idx !== undefined) as number[];
+      lines = lines.filter((_, idx) => !lineIndicesToDelete.includes(idx));
     }
-    
+
+    content = lines.join('\n');
     await writeFile(todoPath, content, 'utf-8');
-    return new ToolResult(true, `TODO list updated: ${action}`, { path: 'AGENT_TODO.md', content });
+
+    // Display pretty list
+    const finalTasks = getTasks();
+    let displayOutput = `\n${chalk.bold.underline('📋 CURRENT TODO LIST')}\n`;
+    if (finalTasks.length === 0) {
+      displayOutput += chalk.gray('  (No items in list)\n');
+    } else {
+      for (const t of finalTasks) {
+        const icon = t.completed ? chalk.green('✔') : chalk.yellow('○');
+        const title = t.completed ? chalk.gray.strikethrough(t.title) : chalk.white(t.title);
+        displayOutput += `  ${chalk.cyan(t.id.toString().padEnd(2))} ${icon} ${title}\n`;
+      }
+    }
+    console.log(displayOutput);
+
+    return new ToolResult(true, `TODO list updated: ${action}`, { path: 'AGENT_TODO.md', items: finalTasks });
   } catch (error: any) {
     return new ToolResult(false, `TODO management failed: ${error.message}`);
   }
@@ -598,6 +909,67 @@ export async function mcpTool(action: string, options: any = {}, mcpClient?: any
     return new ToolResult(false, `Unknown MCP action: ${action}`);
   } catch (error: any) {
     return new ToolResult(false, `MCP operation failed: ${error.message}`);
+  }
+}
+
+/**
+ * Skill Tool - Read and apply specialized engineering skills
+ */
+export async function skillTool(action: string, options: any = {}): Promise<ToolResult> {
+  const { join } = await import('path');
+  const { homedir } = await import('os');
+  
+  const skillPaths = options.paths || [
+    join(homedir(), '.copilot', 'skills'),
+    join(homedir(), '.claude', 'skills')
+  ];
+
+  try {
+    if (action === 'list') {
+      const allSkills: any[] = [];
+      const { existsSync } = await import('fs');
+      const { readdir, readFile } = await import('fs/promises');
+
+      for (const basePath of skillPaths) {
+        if (!existsSync(basePath)) continue;
+        const dirs = await readdir(basePath);
+        for (const dir of dirs) {
+          const skillDir = join(basePath, dir);
+          const skillFile = join(skillDir, 'SKILL.md');
+          if (existsSync(skillFile)) {
+            const content = await readFile(skillFile, 'utf-8');
+            const titleMatch = content.match(/^#\s+(.*)/m);
+            const descMatch = content.match(/^##\s+Description\n([\s\S]*?)\n##/i) || content.match(/^> (.*)/m);
+            
+            allSkills.push({
+              id: dir,
+              path: skillFile,
+              name: titleMatch ? titleMatch[1].trim() : dir,
+              description: descMatch ? descMatch[1].trim().split('\n')[0] : 'No description'
+            });
+          }
+        }
+      }
+      return new ToolResult(true, `Found ${allSkills.length} available skills`, { skills: allSkills });
+    } else if (action === 'read') {
+      const { id } = options;
+      if (!id) return new ToolResult(false, 'Skill ID is required for "read" action');
+
+      const { existsSync } = await import('fs');
+      const { readFile } = await import('fs/promises');
+
+      for (const basePath of skillPaths) {
+        const skillFile = join(basePath, id, 'SKILL.md');
+        if (existsSync(skillFile)) {
+          const content = await readFile(skillFile, 'utf-8');
+          return new ToolResult(true, `Successfully read skill: ${id}`, { id, content });
+        }
+      }
+      return new ToolResult(false, `Skill not found: ${id}`);
+    }
+    return new ToolResult(false, `Unknown skill action: ${action}`);
+  } catch (error: any) {
+    return new ToolResult(false, `Skill operation failed: ${error.message}`);
   }
 }
 
@@ -816,20 +1188,33 @@ export async function loadForgedTools(): Promise<void> {
     });
 
     for (const file of entries) {
-      const toolName = basename(file, '.ts');
+      const fileName = basename(file, '.ts');
+      const dirName = dirname(file);
+      const isSubdir = dirName !== '.';
+      
+      // If in a subdir, use it as a prefix (toolkit namespace)
+      const toolName = isSubdir 
+        ? `${dirName.replace(/[\/\\]/g, '_')}_${fileName}`
+        : fileName;
       
       try {
         // Dynamic import using relative path
-        const modulePath = `./${file}`;
+        const modulePath = `./${file.replace(/\\/g, '/')}`;
         const module = await import(modulePath);
         
-        // If it exports a function with the same name, register it
-        if (typeof module[toolName] === 'function') {
+        // Find the tool function (either named export or default export)
+        const toolFn = (typeof module[fileName] === 'function') 
+          ? module[fileName] 
+          : (module.default && (module.default.name === fileName || !module.default.name)) 
+            ? module.default 
+            : null;
+
+        if (toolFn && typeof toolFn === 'function') {
           registerDynamicTool(toolName, {
-            description: module[toolName].description || `Autonomous tool: ${toolName}`,
-            parameters: module[toolName].parameters || {},
-            execute: module[toolName],
-            source: 'forged-core'
+            description: toolFn.description || `Autonomous tool: ${fileName}`,
+            parameters: toolFn.parameters || {},
+            execute: toolFn,
+            source: isSubdir ? dirName.replace(/[\/\\]/g, '_') : 'forged-core'
           });
         }
       } catch (err: any) {
@@ -901,9 +1286,36 @@ const staticTools: Record<string, any> = {
     parameters: {
       command: { type: 'string', required: true },
       cwd: { type: 'string', default: '.' },
-      timeout: { type: 'number', default: 30000 }
+      timeout: { type: 'number', default: 30000 },
+      isBackground: { type: 'boolean', default: false, description: 'Run in background without blocking' }
     },
     execute: shell
+  },
+  shell_kill: {
+    name: 'shell_kill',
+    description: 'Kill a background process by ID',
+    parameters: {
+      procId: { type: 'string', required: true }
+    },
+    execute: shellKill
+  },
+  shell_output: {
+    name: 'shell_output',
+    description: 'Get last command output or background process output',
+    parameters: {
+      procId: { type: 'string', description: 'Background process ID' },
+      last: { type: 'boolean', default: false, description: 'Get output of the last synchronous command' }
+    },
+    execute: shellOutput
+  },
+  inventory: {
+    name: 'inventory',
+    description: 'List all available tools and specialized toolkits with detailed parameter info',
+    parameters: {
+      query: { type: 'string', description: 'Search for tools by name or description' },
+      toolkit: { type: 'string', description: 'Filter by specific toolkit name' }
+    },
+    execute: inventoryTool
   },
   env: {
     name: 'env',
@@ -934,12 +1346,13 @@ const staticTools: Record<string, any> = {
   },
   todo: {
     name: 'todo',
-    description: 'Manage project TODO list',
+    description: 'Manage project TODO list with batch support',
     parameters: {
-      action: { type: 'string', required: true },
-      task: { type: 'string' },
-      id: { type: 'number' },
-      status: { type: 'string' }
+      action: { type: 'string', required: true, description: '"add", "update", "complete", "delete", or "list"' },
+      task: { type: 'string', description: 'Single task title' },
+      id: { type: 'number', description: 'Single ID for update/complete/delete' },
+      status: { type: 'string', description: 'New status for update' },
+      items: { type: 'array', description: 'Batch items: array of strings for "add", or objects {id, status, task} for update' }
     },
     execute: todoTool
   },
@@ -966,6 +1379,16 @@ const staticTools: Record<string, any> = {
     },
     execute: mcpTool
   },
+  skill: {
+    name: 'skill',
+    description: 'Read and apply specialized engineering skills from the local library',
+    parameters: {
+      action: { type: 'string', required: true, description: 'The action to perform: "list" or "read"' },
+      id: { type: 'string', description: 'The unique ID of the skill to read (required for "read")' },
+      paths: { type: 'array', description: 'Optional list of base paths to search for skills' }
+    },
+    execute: skillTool
+  },
   "forge-audit": {
     name: "forge-audit",
     description: "Analyze current toolset for gaps and suggest improvements",
@@ -991,6 +1414,67 @@ const staticTools: Record<string, any> = {
       url: { type: 'string', required: true }
     },
     execute: browse
+  },
+  spawn_terminal: {
+    name: 'spawn_terminal',
+    description: 'Open a real, visible terminal window on the desktop for long-running tasks or manual oversight.',
+    parameters: {
+      command: { type: 'string', description: 'Initial command to run' },
+      cwd: { type: 'string', description: 'Working directory for the new terminal' },
+      title: { type: 'string', description: 'Window title (Windows only)' }
+    },
+    execute: spawnTerminal
+  },
+  // Virtual Phone Controller Toolkit
+  Virtual_Phone_Controller_VisualInterface: {
+    name: 'Virtual_Phone_Controller_VisualInterface',
+    description: (VisualInterface as any).description,
+    parameters: (VisualInterface as any).parameters,
+    execute: VisualInterface,
+    source: 'Virtual_Phone_Controller'
+  },
+  Virtual_Phone_Controller_DeviceOrchestrator: {
+    name: 'Virtual_Phone_Controller_DeviceOrchestrator',
+    description: (DeviceOrchestrator as any).description,
+    parameters: (DeviceOrchestrator as any).parameters,
+    execute: DeviceOrchestrator,
+    source: 'Virtual_Phone_Controller'
+  },
+  Virtual_Phone_Controller_SystemRelay: {
+    name: 'Virtual_Phone_Controller_SystemRelay',
+    description: (SystemRelay as any).description,
+    parameters: (SystemRelay as any).parameters,
+    execute: SystemRelay,
+    source: 'Virtual_Phone_Controller'
+  },
+  // Autonomous Memory Suite Toolkit
+  Autonomous_Memory_Suite_AnalyzeFailure: {
+    name: 'Autonomous_Memory_Suite_AnalyzeFailure',
+    description: (AnalyzeFailure as any).description,
+    parameters: (AnalyzeFailure as any).parameters,
+    execute: AnalyzeFailure,
+    source: 'Autonomous_Memory_Suite'
+  },
+  Autonomous_Memory_Suite_DecomposeObjective: {
+    name: 'Autonomous_Memory_Suite_DecomposeObjective',
+    description: (DecomposeObjective as any).description,
+    parameters: (DecomposeObjective as any).parameters,
+    execute: DecomposeObjective,
+    source: 'Autonomous_Memory_Suite'
+  },
+  Autonomous_Memory_Suite_PersistTrace: {
+    name: 'Autonomous_Memory_Suite_PersistTrace',
+    description: (PersistTrace as any).description,
+    parameters: (PersistTrace as any).parameters,
+    execute: PersistTrace,
+    source: 'Autonomous_Memory_Suite'
+  },
+  Autonomous_Memory_Suite_UpdateHeuristics: {
+    name: 'Autonomous_Memory_Suite_UpdateHeuristics',
+    description: (UpdateHeuristics as any).description,
+    parameters: (UpdateHeuristics as any).parameters,
+    execute: UpdateHeuristics,
+    source: 'Autonomous_Memory_Suite'
   }
 };
 

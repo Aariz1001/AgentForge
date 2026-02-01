@@ -139,11 +139,21 @@ async function searchBrave(query: string, apiKey: string, maxResults: number): P
 export async function browse(url: string, options: any = {}): Promise<ToolResult> {
   try {
     const response = await fetch(url, {
-      headers: { 'User-Agent': USER_AGENT },
-      signal: AbortSignal.timeout(15000)
+      headers: { 
+        'User-Agent': USER_AGENT,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Referer': 'https://www.google.com/'
+      },
+      signal: AbortSignal.timeout(20000)
     });
     
     if (!response.ok) {
+      if (response.status === 403) {
+        return new ToolResult(false, `Browse failed: 403 Forbidden. This site (e.g., Product Hunt) may have aggressive bot protection. Try using "search" to find snippets from this site instead.`);
+      }
       return new ToolResult(false, `Browse failed: ${response.status} ${response.statusText}`);
     }
     

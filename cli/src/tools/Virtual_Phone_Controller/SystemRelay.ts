@@ -6,6 +6,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { exec as execCallback } from 'child_process';
+import { ensureAdb } from './utils';
 
 const execAsync = promisify(execCallback);
 
@@ -92,6 +93,8 @@ export async function SystemRelay(args: any, options: any = {}): Promise<ToolRes
     if (!args || typeof args !== 'object') {
       throw new Error('Arguments must be an object');
     }
+
+    await ensureAdb();
 
     const {
       command,

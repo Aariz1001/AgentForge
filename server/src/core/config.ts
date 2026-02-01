@@ -116,6 +116,24 @@ const SwarmSettingsSchema = z.object({
   todo: SwarmTodoSettingsSchema.default({}),
 });
 
+const MCPSettingsSchema = z.object({
+  servers: z.array(z.object({
+    id: z.string(),
+    url: z.string(),
+    name: z.string()
+  })).default([
+    { id: 'context7', url: 'https://mcp.context7.io', name: 'Context7 Documentation Server' },
+    { id: 'langchain', url: 'https://mcp.langchain.com', name: 'LangChain Docs Server' }
+  ])
+});
+
+const SkillsSettingsSchema = z.object({
+  paths: z.array(z.string()).default([
+    'c:/Users/maari/.copilot/skills',
+    'c:/Users/maari/.claude/skills'
+  ])
+});
+
 const SettingsSchema = z.object({
   appName: z.string().default('AgentForge Kernel'),
   appVersion: z.string().default('1.0.0'),
@@ -129,6 +147,8 @@ const SettingsSchema = z.object({
   api: APISettingsSchema.default({}),
   forge: ForgeSettingsSchema.default({}),
   swarm: SwarmSettingsSchema.default({}),
+  mcp: MCPSettingsSchema.default({}),
+  skills: SkillsSettingsSchema.default({}),
   dataDir: z.string().default('/tmp/agentforge'),
   cacheDir: z.string().default('/tmp/agentforge/cache'),
 });

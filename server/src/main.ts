@@ -14,7 +14,9 @@ import {
   TodoRegistry,
   PlanWriter,
   SwarmOrchestrator,
-  SwarmStore
+  SwarmStore,
+  MCPManagerService,
+  SkillManagerService
 } from './services';
 
 const app = (express as any).default ? (express as any).default() : (express as any)();
@@ -40,6 +42,8 @@ const todoRegistry = new TodoRegistry({
   maxItems: settings.swarm.todo.maxItems
 });
 const planWriter = new PlanWriter();
+const mcpManager = new MCPManagerService(db, settings.mcp.servers);
+const skillManager = new SkillManagerService(settings.skills.paths);
 const swarmStore = new SwarmStore();
 const swarm = new SwarmOrchestrator(runtimeConfig, {
   openrouter,
@@ -149,6 +153,34 @@ app.get('/swarm/memory', (req: Request, res: Response) => {
 
 app.get('/swarm/todos', (req: Request, res: Response) => {
   res.json({ todos: todoRegistry.list() });
+});
+
+// MCP Management
+app.get('/mcp/servers', async (req: Request, res: Response) => {
+  const servers = await mcpManager.listServers();
+  res.json({ servers });
+});
+
+app.post('/mcp/query', async (req: Request, res: Response) => {
+  const { serverId, query } = req.body;
+  try {
+    const result = await mcpManager.queryDocs(serverId, query);
+    res.json(result);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Skill Management
+app.get('/skills', async (req: Request, res: Response) => {
+  const skills = await skillManager.scanSkills();
+  res.json({ skills });
+});
+
+app.get('/skills/:id', async (req: Request, res: Response) => {
+  const skill = await skillManager.getSkill(req.params.id);
+  if (!skill) return res.status(404).json({ error: 'Skill not found' });
+  res.json({ skill });
 });
 
 // Start server
