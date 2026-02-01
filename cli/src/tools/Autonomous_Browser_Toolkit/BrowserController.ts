@@ -11,7 +11,7 @@ interface WindowSize {
 }
 
 interface BrowserControllerArgs {
-  action: 'launch' | 'open' | 'start' | 'close' | 'quit' | 'exit' | 'get_tabs' | 'tabs' | 'list_tabs' | 'switch_tab' | 'new_tab' | 'close_tab';
+  action: 'launch' | 'open' | 'start' | 'close' | 'quit' | 'exit' | 'get_tabs' | 'tabs' | 'list_tabs' | 'switch_tab' | 'new_tab' | 'close_tab' | 'relaunch' | 'restart' | 'reopen' | 'relaunch_headed';
   browserId?: string;
   headless?: boolean;
   profile?: string;
@@ -100,6 +100,11 @@ export async function BrowserController(args: BrowserControllerArgs, options: an
     if (action === 'open' || action === 'start') action = 'launch';
     if (action === 'quit' || action === 'exit') action = 'close';
     if (action === 'tabs' || action === 'list_tabs') action = 'get_tabs';
+    if (action === 'restart' || action === 'reopen') action = 'relaunch';
+    if (action === 'relaunch_headed') {
+      action = 'relaunch';
+      args.headless = false;
+    }
 
     if (!action) {
       return new ToolResult(false, 'Action parameter is required');
@@ -123,6 +128,9 @@ export async function BrowserController(args: BrowserControllerArgs, options: an
       
       case 'close_tab':
         return await closeTab(args);
+
+      case 'relaunch':
+        return await relaunchBrowser(args);
       
       default:
         return new ToolResult(false, `Unknown action: ${action}`);
@@ -136,7 +144,12 @@ async function launchBrowser(args: BrowserControllerArgs): Promise<ToolResult> {
   try {
     registerCleanup();
 
-    const browserId = crypto.randomBytes(8).toString('hex');
+    const requestedId = args.browserId;
+    if (requestedId && browserRegistry.has(requestedId)) {
+      return new ToolResult(false, `Browser ID ${requestedId} already exists`);
+    }
+
+    const browserId = requestedId || crypto.randomBytes(8).toString('hex');
     const headless = args.headless !== false;
     const profile = args.profile;
     const userAgent = args.userAgent;
@@ -218,6 +231,44 @@ async function launchBrowser(args: BrowserControllerArgs): Promise<ToolResult> {
     );
   } catch (error: any) {
     return new ToolResult(false, `Failed to launch browser: ${error.message}`);
+  }
+}
+
+async function relaunchBrowser(args: BrowserControllerArgs): Promise<ToolResult> {
+  try {
+    const browserId = args.browserId;
+    if (!browserId) {
+      return new ToolResult(false, 'browserId is required for relaunch action');
+    }
+
+    const instance = browserRegistry.get(browserId);
+    if (!instance) {
+      return new ToolResult(false, `Browser with ID ${browserId} not found`);
+    }
+
+    const profile = args.profile ?? instance.profile;
+    const userAgent = args.userAgent ?? instance.userAgent;
+    const windowSize = args.windowSize ?? instance.windowSize;
+    const headless = args.headless ?? instance.headless;
+
+    try {
+      await instance.browser.close();
+    } catch {
+      // ignore close errors
+    }
+
+    browserRegistry.delete(browserId);
+
+    return await launchBrowser({
+      action: 'launch',
+      browserId,
+      headless,
+      profile,
+      userAgent,
+      windowSize,
+    });
+  } catch (error: any) {
+    return new ToolResult(false, `Failed to relaunch browser: ${error.message}`);
   }
 }
 
@@ -450,13 +501,13 @@ async function closeTab(args: BrowserControllerArgs): Promise<ToolResult> {
 (BrowserController as any).parameters = {
   action: {
     type: "string",
-    description: "Action to perform: 'launch' (aliases: open/start), 'close' (aliases: quit/exit), 'get_tabs' (aliases: tabs/list_tabs), 'switch_tab', 'new_tab', or 'close_tab'",
+    description: "Action to perform: 'launch' (aliases: open/start), 'close' (aliases: quit/exit), 'get_tabs' (aliases: tabs/list_tabs), 'switch_tab', 'new_tab', 'close_tab', or 'relaunch' (aliases: restart/reopen/relaunch_headed)",
     required: true,
-    enum: ['launch', 'open', 'start', 'close', 'quit', 'exit', 'get_tabs', 'tabs', 'list_tabs', 'switch_tab', 'new_tab', 'close_tab']
+    enum: ['launch', 'open', 'start', 'close', 'quit', 'exit', 'get_tabs', 'tabs', 'list_tabs', 'switch_tab', 'new_tab', 'close_tab', 'relaunch', 'restart', 'reopen', 'relaunch_headed']
   },
   browserId: {
     type: "string",
-    description: "Browser instance ID (required for all actions except 'launch')",
+    description: "Browser instance ID (required for all actions except 'launch'; can be provided to preserve ID on relaunch)",
     required: false
   },
   headless: {

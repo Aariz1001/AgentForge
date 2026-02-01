@@ -10,7 +10,26 @@ import { getBrowserRegistry } from './BrowserController';
 
 // ========== Type Definitions ==========
 
-export type ActionType = 'click' | 'type' | 'hover' | 'select' | 'check' | 'uncheck' | 'drag' | 'scroll_to' | 'scroll';
+export type ActionType =
+  | 'click'
+  | 'type'
+  | 'hover'
+  | 'select'
+  | 'check'
+  | 'uncheck'
+  | 'drag'
+  | 'scroll_to'
+  | 'scroll'
+  // common aliases
+  | 'tap'
+  | 'tap_by_text'
+  | 'click_text'
+  | 'click_by_text'
+  | 'type_text'
+  | 'fill'
+  | 'scroll_into_view'
+  | 'tick'
+  | 'untick';
 
 export interface ElementInteractorInput {
   action: ActionType;
@@ -19,6 +38,7 @@ export interface ElementInteractorInput {
   selector?: string;
   xpath?: string;
   text?: string;
+  targetText?: string;
   value?: string;
   options?: string[];
   coordinates?: { x: number; y: number };
@@ -175,16 +195,45 @@ class ElementFinder {
 
 // ========== Element Interactor ==========
 
-export class ElementInteractor {
+export class ElementInteractorCore {
   /**
    * Perform element interaction actions
    */
   static async interact(input: ElementInteractorInput): Promise<ToolResult> {
     const warnings: string[] = [];
 
+    // Normalize aliases and convenience fields
+    const normalizeAction = (action: ActionType): ActionType => {
+      switch (action) {
+        case 'tap':
+          return 'click';
+        case 'tap_by_text':
+        case 'click_text':
+        case 'click_by_text':
+          return 'click';
+        case 'type_text':
+        case 'fill':
+          return 'type';
+        case 'scroll_into_view':
+          return 'scroll_to';
+        case 'tick':
+          return 'check';
+        case 'untick':
+          return 'uncheck';
+        default:
+          return action;
+      }
+    };
+
+    const normalizedInput: ElementInteractorInput = {
+      ...input,
+      action: normalizeAction(input.action),
+      text: input.text ?? input.targetText,
+    };
+
     try {
       // Validate input
-      const validationError = this.validateInput(input);
+      const validationError = this.validateInput(normalizedInput);
       if (validationError) {
         return {
           success: false,
@@ -193,15 +242,15 @@ export class ElementInteractor {
       }
 
       const registry = getBrowserRegistry();
-      const instance = registry.get(input.browserId);
+      const instance = registry.get(normalizedInput.browserId);
       if (!instance) {
         return {
           success: false,
-          error: `Browser instance '${input.browserId}' not found. Please create a browser instance first using BrowserController.`,
+          error: `Browser instance '${normalizedInput.browserId}' not found. Please create a browser instance first using BrowserController.`,
         };
       }
 
-      let page: Page | undefined = input.tabId ? instance.pages.get(input.tabId) : undefined;
+      let page: Page | undefined = normalizedInput.tabId ? instance.pages.get(normalizedInput.tabId) : undefined;
       if (!page) {
         page = Array.from(instance.pages.values()).find(p => !p.isClosed());
       }
@@ -209,35 +258,35 @@ export class ElementInteractor {
       if (!page || page.isClosed()) {
         return {
           success: false,
-          error: `Browser instance '${input.browserId}' has no active pages. Create a new tab first.`,
+          error: `Browser instance '${normalizedInput.browserId}' has no active pages. Create a new tab first.`,
         };
       }
 
       // Set defaults
       const clampTimeout = (value: number) => Math.min(Math.max(value, 3000), 45000);
-      const timeout = clampTimeout(input.timeout ?? 15000);
-      const waitForElement = input.waitForElement ?? true;
-      const autoScroll = input.autoScroll ?? true;
-      const autoWaitForNavigation = input.autoWaitForNavigation ?? (input.action === 'click');
-      const navigationTimeout = clampTimeout(input.navigationTimeout ?? 8000);
-      const autoRetry = Math.min(Math.max(input.autoRetry ?? 1, 0), 3);
+      const timeout = clampTimeout(normalizedInput.timeout ?? 15000);
+      const waitForElement = normalizedInput.waitForElement ?? true;
+      const autoScroll = normalizedInput.autoScroll ?? true;
+      const autoWaitForNavigation = normalizedInput.autoWaitForNavigation ?? (normalizedInput.action === 'click');
+      const navigationTimeout = clampTimeout(normalizedInput.navigationTimeout ?? 8000);
+      const autoRetry = Math.min(Math.max(normalizedInput.autoRetry ?? 1, 0), 3);
 
       // Find element (if not coordinate-based action)
       let element: ElementHandle | null = null;
       let elementBefore: ElementProperties | undefined;
 
-      if (input.action !== 'click' || !input.coordinates) {
+      if (normalizedInput.action !== 'click' || !normalizedInput.coordinates) {
         const findTimeout = waitForElement ? timeout : 1000;
         element = await ElementFinder.findElement(
           page,
-          input.selector,
-          input.xpath,
-          input.text,
+          normalizedInput.selector,
+          normalizedInput.xpath,
+          normalizedInput.text,
           findTimeout
         );
 
         if (!element) {
-          const selectorDesc = input.selector || input.xpath || input.text;
+          const selectorDesc = normalizedInput.selector || normalizedInput.xpath || normalizedInput.text;
           return {
             success: false,
             error: waitForElement
@@ -256,7 +305,7 @@ export class ElementInteractor {
       }
 
       // Auto-scroll element into view for non-scroll actions
-      if (autoScroll && element && input.action !== 'scroll' && input.action !== 'scroll_to') {
+      if (autoScroll && element && normalizedInput.action !== 'scroll' && normalizedInput.action !== 'scroll_to') {
         try {
           await element.evaluate((el: Element) => {
             el.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'center' });
@@ -282,7 +331,7 @@ export class ElementInteractor {
               .catch(() => false)
           : Promise.resolve(false);
 
-        actionResult = await this.performAction(page, element, input);
+        actionResult = await this.performAction(page, element, normalizedInput);
         navigated = await navPromise;
 
         if (actionResult.success) {
@@ -294,9 +343,9 @@ export class ElementInteractor {
           const findTimeout = waitForElement ? timeout : 1000;
           element = await ElementFinder.findElement(
             page,
-            input.selector,
-            input.xpath,
-            input.text,
+            normalizedInput.selector,
+            normalizedInput.xpath,
+            normalizedInput.text,
             findTimeout
           );
           attempt++;
@@ -337,7 +386,7 @@ export class ElementInteractor {
       // Build result
       const result: ElementInteractionResult = {
         success: true,
-        action: input.action,
+        action: normalizedInput.action,
         element: elementBefore,
         elementAfter,
         screenshot,
@@ -349,8 +398,8 @@ export class ElementInteractor {
         success: true,
         data: result,
         metadata: {
-          browserId: input.browserId,
-          action: input.action,
+          browserId: normalizedInput.browserId,
+          action: normalizedInput.action,
           navigated,
           retries: attempt,
           autoScroll,
@@ -363,8 +412,8 @@ export class ElementInteractor {
         success: false,
         error: `Unexpected error during element interaction: ${error.message}`,
         metadata: {
-          browserId: input.browserId,
-          action: input.action,
+          browserId: normalizedInput.browserId,
+          action: normalizedInput.action,
         },
       };
     }
@@ -533,6 +582,10 @@ export class ElementInteractor {
 
 // ========== Exports ==========
 
+export async function ElementInteractor(input: ElementInteractorInput): Promise<ToolResult> {
+  return ElementInteractorCore.interact(input);
+}
+
 export default ElementInteractor;
 
 // Tool metadata for AI agents
@@ -555,8 +608,8 @@ export const ElementInteractorMetadata = {
     properties: {
       action: {
         type: 'string',
-        enum: ['click', 'type', 'hover', 'select', 'check', 'uncheck', 'drag', 'scroll_to', 'scroll'],
-        description: 'The interaction action to perform',
+        enum: ['click', 'type', 'hover', 'select', 'check', 'uncheck', 'drag', 'scroll_to', 'scroll', 'tap', 'tap_by_text', 'click_text', 'click_by_text', 'type_text', 'fill', 'scroll_into_view', 'tick', 'untick'],
+        description: 'The interaction action to perform (aliases: tap, tap_by_text, click_text, click_by_text, type_text, fill, scroll_into_view, tick, untick)',
       },
       browserId: {
         type: 'string',
@@ -577,6 +630,10 @@ export const ElementInteractorMetadata = {
       text: {
         type: 'string',
         description: 'Text content to match for finding the element',
+      },
+      targetText: {
+        type: 'string',
+        description: 'Alias for text matching (e.g., "Accept all")',
       },
       value: {
         type: 'string',

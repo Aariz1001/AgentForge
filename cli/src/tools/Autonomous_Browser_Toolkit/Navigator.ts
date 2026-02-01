@@ -4,7 +4,7 @@ import * as crypto from 'crypto';
 import { getBrowserRegistry } from './BrowserController';
 
 interface NavigatorArgs {
-  action: 'goto' | 'back' | 'forward' | 'refresh' | 'navigate' | 'open';
+  action: 'goto' | 'back' | 'forward' | 'refresh' | 'navigate' | 'open' | 'search';
   browserId: string;
   tabId?: string;
   url?: string;
@@ -12,6 +12,11 @@ interface NavigatorArgs {
   timeout?: number;
   autoWait?: boolean;
   autoWaitTimeout?: number;
+  query?: string;
+  engine?: 'duckduckgo' | 'brave' | 'google' | 'bing';
+  autoHITL?: boolean;
+  hitlMessage?: string;
+  hitlInstructions?: string;
 }
 
 interface NavigationData {
@@ -29,6 +34,9 @@ interface NavigationData {
   autoWaitStatus: 'completed' | 'skipped' | 'failed';
   navigationWarning: string | null;
   navigationError: string | null;
+  captchaDetected?: boolean;
+  requiresHITL?: boolean;
+  hitlStatus?: 'done' | 'cancel' | 'skipped';
   timestamp: string;
 }
 
@@ -41,13 +49,36 @@ interface ErrorData {
 }
 
 export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
-  let { action, browserId, tabId, url, waitUntil = 'domcontentloaded', timeout = 15000, autoWait = true, autoWaitTimeout = 5000 } = args;
+  let { action, browserId, tabId, url, waitUntil = 'domcontentloaded', timeout = 15000, autoWait = true, autoWaitTimeout = 5000, query, engine = 'duckduckgo', autoHITL = false, hitlMessage, hitlInstructions } = args;
 
   const clampTimeout = (value: number) => Math.min(Math.max(value, 3000), 45000);
   timeout = clampTimeout(timeout);
   autoWaitTimeout = clampTimeout(autoWaitTimeout);
 
   if (action === 'navigate' || action === 'open') {
+    action = 'goto';
+  }
+
+  if (action === 'search') {
+    if (!query) {
+      return new ToolResult(false, "query is required for 'search' action");
+    }
+
+    const encoded = encodeURIComponent(query);
+    const engineUrl = (() => {
+      switch (engine) {
+        case 'brave':
+          return `https://search.brave.com/search?q=${encoded}`;
+        case 'google':
+          return `https://www.google.com/search?q=${encoded}`;
+        case 'bing':
+          return `https://www.bing.com/search?q=${encoded}`;
+        default:
+          return `https://duckduckgo.com/?q=${encoded}`;
+      }
+    })();
+
+    url = engineUrl;
     action = 'goto';
   }
 
@@ -200,6 +231,44 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
       }
     }
 
+    // Detect captcha or bot checks
+    const captchaDetected = await page.evaluate(() => {
+      const text = (document.body?.innerText || '').toLowerCase();
+      const title = (document.title || '').toLowerCase();
+      const hasCaptchaText =
+        text.includes('captcha') ||
+        text.includes("i'm not a robot") ||
+        text.includes('are you a robot') ||
+        text.includes('unusual traffic') ||
+        text.includes('verify you are human') ||
+        text.includes('cloudflare') ||
+        title.includes('captcha');
+      const hasCaptchaWidget =
+        !!document.querySelector('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], .g-recaptcha, .h-captcha, [data-sitekey]');
+      return hasCaptchaText || hasCaptchaWidget;
+    });
+
+    let requiresHITL = false;
+    let hitlStatus: 'done' | 'cancel' | 'skipped' = 'skipped';
+    if (captchaDetected) {
+      requiresHITL = true;
+      if (instance.headless) {
+        navigationWarning = navigationWarning
+          ? `${navigationWarning} Captcha detected in headless mode.`
+          : 'Captcha detected in headless mode.';
+      } else if (autoHITL) {
+        try {
+          const { HumanInTheLoop } = await import('./HumanInTheLoop');
+          const message = hitlMessage || 'Captcha detected. Manual intervention required.';
+          const instructions = hitlInstructions || 'Please solve the captcha in the browser, then confirm to continue.';
+          const hitlResult = await HumanInTheLoop({ action: 'pause', message, instructions, allowCancel: true });
+          hitlStatus = hitlResult.success ? 'done' : 'cancel';
+        } catch {
+          hitlStatus = 'skipped';
+        }
+      }
+    }
+
     // Get final page information
     const finalUrl = page.url();
     let pageTitle = '';
@@ -228,6 +297,9 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
       autoWaitStatus,
       navigationWarning,
       navigationError,
+      captchaDetected,
+      requiresHITL,
+      hitlStatus,
       timestamp: new Date().toISOString()
     };
 
@@ -236,6 +308,14 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
         false,
         `Navigation ${action} failed: ${navigationError}`,
         { ...data, tabId }
+      );
+    }
+
+    if (captchaDetected && instance.headless) {
+      return new ToolResult(
+        false,
+        'Captcha detected. Relaunch browser in headed mode and use HumanInTheLoop to complete it.',
+        { ...data, tabId, recommendedAction: 'relaunch_headed' }
       );
     }
 
@@ -274,9 +354,9 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
 (Navigator as any).parameters = {
   action: {
     type: "string",
-    description: "Navigation action: 'goto' (aliases: navigate/open), 'back', 'forward', 'refresh'",
+    description: "Navigation action: 'goto' (aliases: navigate/open), 'back', 'forward', 'refresh', or 'search'",
     required: true,
-    enum: ['goto', 'navigate', 'open', 'back', 'forward', 'refresh']
+    enum: ['goto', 'navigate', 'open', 'back', 'forward', 'refresh', 'search']
   },
   browserId: {
     type: "string",
@@ -292,6 +372,18 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
     type: "string",
     description: "Target URL to navigate to (required only for 'goto' action). Must include protocol (http:// or https://)",
     required: false
+  },
+  query: {
+    type: "string",
+    description: "Search query (required only for 'search' action)",
+    required: false
+  },
+  engine: {
+    type: "string",
+    description: "Search engine to use for 'search' action (duckduckgo, brave, google, bing). Default: duckduckgo",
+    required: false,
+    enum: ['duckduckgo', 'brave', 'google', 'bing'],
+    default: 'duckduckgo'
   },
   waitUntil: {
     type: "string",
@@ -317,6 +409,22 @@ export async function Navigator(args: NavigatorArgs): Promise<ToolResult> {
     description: "Timeout in milliseconds for auto-wait network idle step",
     required: false,
     default: 5000
+  },
+  autoHITL: {
+    type: "boolean",
+    description: "If a captcha is detected and browser is headed, pause for manual completion",
+    required: false,
+    default: false
+  },
+  hitlMessage: {
+    type: "string",
+    description: "Custom message to display when autoHITL is triggered",
+    required: false
+  },
+  hitlInstructions: {
+    type: "string",
+    description: "Detailed instructions shown during autoHITL pause",
+    required: false
   }
 };
 
