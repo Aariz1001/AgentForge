@@ -1,7 +1,8 @@
 import { v4 as uuidv4 } from 'uuid';
 import { OpenRouterService } from './openrouter';
 import { OrchestrationService } from './orchestration';
-import { SharedMemoryService } from './shared-memory';
+import { MemoryEngine } from './memory/memory-engine';
+import { MemoryTier } from './memory/hierarchy-manager';
 import { TodoRegistry } from './todo-registry';
 import { PlanWriter } from './plan-writer';
 import { SwarmRunRequest, SwarmRunResult, SwarmAgentResult, SwarmTask } from './swarm-types';
@@ -15,14 +16,14 @@ interface Config {
 export class SwarmOrchestrator {
   private openrouter: OpenRouterService;
   private orchestrator: OrchestrationService;
-  private memory: SharedMemoryService;
+  private memory: MemoryEngine;
   private todos: TodoRegistry;
   private planWriter: PlanWriter;
 
   constructor(_config: Config, deps: {
     openrouter: OpenRouterService;
     orchestrator: OrchestrationService;
-    memory: SharedMemoryService;
+    memory: MemoryEngine;
     todos: TodoRegistry;
     planWriter: PlanWriter;
   }) {
@@ -117,7 +118,15 @@ export class SwarmOrchestrator {
         workingDirectory: request.context?.workingDirectory
       });
       results.push(result);
-      this.memory.set(`swarm:${task.id}`, result);
+      const content = result.summary || `Swarm task ${task.id} completed`;
+      this.memory.remember(content, {
+        key: `swarm:${task.id}`,
+        tier: MemoryTier.EPISODIC,
+        tags: ['swarm', task.title, role],
+        source: 'swarm',
+        metadata: result,
+        importance: 0.6
+      });
       this.todos.add(`Review ${task.title}`);
 
       await runNext();

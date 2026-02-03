@@ -3,6 +3,7 @@ import { Request, Response } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
+import { join } from 'path';
 import { settings } from './core/config';
 import { initDatabase, AppDataSource } from './models/database';
 import { Tool } from './models/schema';
@@ -10,7 +11,7 @@ import {
   DatabaseService,
   OpenRouterService,
   OrchestrationService,
-  SharedMemoryService,
+  MemoryEngine,
   TodoRegistry,
   PlanWriter,
   SwarmOrchestrator,
@@ -34,9 +35,10 @@ const runtimeConfig = {
 const db = new DatabaseService(settings.database.url);
 const openrouter = new OpenRouterService(runtimeConfig);
 const orchestrator = new OrchestrationService(runtimeConfig, db);
-const sharedMemory = new SharedMemoryService({
+const memoryEngine = new MemoryEngine({
   maxEntries: settings.swarm.memory.maxEntries,
-  ttlSeconds: settings.swarm.memory.ttlSeconds
+  ttlSeconds: settings.swarm.memory.ttlSeconds,
+  persistPath: join(settings.dataDir, 'memory', 'memories.json')
 });
 const todoRegistry = new TodoRegistry({
   maxItems: settings.swarm.todo.maxItems
@@ -48,7 +50,7 @@ const swarmStore = new SwarmStore();
 const swarm = new SwarmOrchestrator(runtimeConfig, {
   openrouter,
   orchestrator,
-  memory: sharedMemory,
+  memory: memoryEngine,
   todos: todoRegistry,
   planWriter
 });
@@ -148,7 +150,45 @@ app.get('/swarm/run/:id', (req: Request, res: Response) => {
 });
 
 app.get('/swarm/memory', (req: Request, res: Response) => {
-  res.json({ entries: sharedMemory.list() });
+  res.json({ entries: memoryEngine.list() });
+});
+
+// Memory Management
+app.post('/memory/store', (req: Request, res: Response) => {
+  const { content, key, tier, tags, source, metadata, importance, pinned } = req.body || {};
+  if (typeof content !== 'string' || content.trim().length === 0) {
+    res.status(400).json({ error: 'content must be a non-empty string' });
+    return;
+  }
+
+  const record = memoryEngine.remember(content, {
+    key,
+    tier,
+    tags,
+    source,
+    metadata,
+    importance,
+    pinned
+  });
+  res.json({ record });
+});
+
+app.post('/memory/search', (req: Request, res: Response) => {
+  const { query, limit, tiers, tags, source, weights, includeMetadata } = req.body || {};
+  const results = memoryEngine.search(String(query || ''), {
+    limit,
+    tiers,
+    tags,
+    source,
+    weights,
+    includeMetadata
+  });
+  res.json({ results });
+});
+
+app.post('/memory/consolidate', (_req: Request, res: Response) => {
+  const promoted = memoryEngine.consolidate();
+  res.json({ promoted });
 });
 
 app.get('/swarm/todos', (req: Request, res: Response) => {
@@ -187,6 +227,7 @@ app.get('/skills/:id', async (req: Request, res: Response) => {
 const start = async () => {
   try {
     await initDatabase();
+    await memoryEngine.load();
     
     app.listen(settings.api.port, settings.api.host, () => {
       console.log(`==================================================`);

@@ -10,6 +10,7 @@ export { ToolGatewayService, ToolManifest, ExecutionResult } from './tool-gatewa
 export { DatabaseService } from './database';
 export { OpenRouterService, OpenRouterConfig, ModelProfile, LLMRequest, LLMResponse } from './openrouter';
 export { SharedMemoryService, MemoryEntry } from './shared-memory';
+export { MemoryEngine, MemoryRecord, MemorySearchResult, MemorySearchOptions } from './memory/memory-engine';
 export { TodoRegistry, TodoItem } from './todo-registry';
 export { PlanWriter } from './plan-writer';
 export { SwarmOrchestrator } from './swarm-orchestrator';
