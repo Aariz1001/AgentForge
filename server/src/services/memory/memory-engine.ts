@@ -47,6 +47,13 @@ export interface MemorySearchResult {
   };
 }
 
+export interface MemoryCompactionReport {
+  clusters: number;
+  summariesCreated: number;
+  deleted: number;
+  retained: number;
+}
+
 export interface MemoryEngineOptions {
   maxEntries: number;
   ttlSeconds: number;
@@ -260,6 +267,112 @@ export class MemoryEngine {
     }
     if (promoted > 0) this.scheduleSave();
     return promoted;
+  }
+
+  compact(options: {
+    minClusterSize?: number;
+    keepPerCluster?: number;
+    createSummaries?: boolean;
+  } = {}): MemoryCompactionReport {
+    const minClusterSize = options.minClusterSize ?? 3;
+    const keepPerCluster = options.keepPerCluster ?? 2;
+    const createSummaries = options.createSummaries ?? true;
+
+    const ids = Array.from(this.records.keys());
+    const parent = new Map<string, string>();
+
+    const find = (x: string): string => {
+      const p = parent.get(x) || x;
+      if (p !== x) parent.set(x, find(p));
+      return parent.get(x) || x;
+    };
+
+    const union = (a: string, b: string): void => {
+      const ra = find(a);
+      const rb = find(b);
+      if (ra !== rb) parent.set(ra, rb);
+    };
+
+    for (const [band, bandIds] of this.lshIndex.entries()) {
+      const bandList = Array.from(bandIds);
+      if (bandList.length < 2) continue;
+      for (let i = 1; i < bandList.length; i++) {
+        union(bandList[0], bandList[i]);
+      }
+    }
+
+    const clusters = new Map<string, string[]>();
+    for (const id of ids) {
+      const root = find(id);
+      if (!clusters.has(root)) clusters.set(root, []);
+      clusters.get(root)!.push(id);
+    }
+
+    let summariesCreated = 0;
+    let deleted = 0;
+    let retained = 0;
+
+    for (const cluster of clusters.values()) {
+      if (cluster.length < minClusterSize) {
+        retained += cluster.length;
+        continue;
+      }
+
+      const records = cluster
+        .map(id => this.records.get(id))
+        .filter(Boolean) as MemoryRecord[];
+
+      const candidates = records.filter(r => r.tier === MemoryTier.EPISODIC && !r.pinned);
+      if (candidates.length < minClusterSize) {
+        retained += records.length;
+        continue;
+      }
+
+      const centroid = candidates[0].embedding;
+      const scored = candidates.map(r => ({
+        record: r,
+        score: this.cosineSimilarity(centroid, r.embedding) + r.importance + r.accessCount * 0.02
+      }));
+
+      scored.sort((a, b) => b.score - a.score);
+      const keep = new Set(scored.slice(0, keepPerCluster).map(s => s.record.id));
+
+      if (createSummaries) {
+        const tokens = candidates.flatMap(r => this.tokenize(r.content));
+        const topTokens = Array.from(tokens.reduce((acc, t) => acc.set(t, (acc.get(t) || 0) + 1), new Map<string, number>()))
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 8)
+          .map(([t]) => t);
+        const summaryContent = `Constellation summary: ${topTokens.join(', ')}.`;
+        this.remember(summaryContent, {
+          tier: MemoryTier.SEMANTIC,
+          tags: ['compaction', 'constellation'],
+          metadata: {
+            clusterSize: cluster.length,
+            kept: Array.from(keep),
+            sample: candidates.slice(0, 2).map(r => r.content)
+          },
+          importance: 0.75
+        });
+        summariesCreated += 1;
+      }
+
+      for (const record of candidates) {
+        if (keep.has(record.id)) {
+          retained += 1;
+          continue;
+        }
+        this.delete(record.id);
+        deleted += 1;
+      }
+    }
+
+    return {
+      clusters: clusters.size,
+      summariesCreated,
+      deleted,
+      retained
+    };
   }
 
   private buildRecord(id: string, content: string, options: {

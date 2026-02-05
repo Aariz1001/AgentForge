@@ -17,7 +17,11 @@ import {
   SwarmOrchestrator,
   SwarmStore,
   MCPManagerService,
-  SkillManagerService
+  SkillManagerService,
+  ToolTapeService,
+  ResourceGuardService,
+  RecoveryService,
+  PhoenixCompactorService
 } from './services';
 
 const app = (express as any).default ? (express as any).default() : (express as any)();
@@ -44,7 +48,14 @@ const todoRegistry = new TodoRegistry({
   maxItems: settings.swarm.todo.maxItems
 });
 const planWriter = new PlanWriter();
-const mcpManager = new MCPManagerService(db, settings.mcp.servers);
+const toolTape = new ToolTapeService();
+const resourceGuard = new ResourceGuardService();
+const recoveryService = new RecoveryService();
+const phoenixCompactor = new PhoenixCompactorService(memoryEngine);
+const mcpManager = new MCPManagerService(db, settings.mcp.servers, {
+  toolTape,
+  resourceGuard
+});
 const skillManager = new SkillManagerService(settings.skills.paths);
 const swarmStore = new SwarmStore();
 const swarm = new SwarmOrchestrator(runtimeConfig, {
@@ -191,6 +202,33 @@ app.post('/memory/consolidate', (_req: Request, res: Response) => {
   res.json({ promoted });
 });
 
+// PhoenixTape Management
+app.get('/phoenix/status', async (_req: Request, res: Response) => {
+  const stats = await toolTape.getStats();
+  res.json({
+    toolTape: stats,
+    memory: {
+      entries: memoryEngine.list().length
+    }
+  });
+});
+
+app.post('/phoenix/compact', async (req: Request, res: Response) => {
+  const { mode = 'full', dryRun = false } = req.body || {};
+  try {
+    const report: any = {};
+    if (mode === 'full' || mode === 'tape') {
+      report.tape = await phoenixCompactor.runTapeCompaction({ dryRun });
+    }
+    if (mode === 'full' || mode === 'memory') {
+      report.memory = await phoenixCompactor.runMemoryCompaction();
+    }
+    res.json({ report });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/swarm/todos', (req: Request, res: Response) => {
   res.json({ todos: todoRegistry.list() });
 });
@@ -228,6 +266,9 @@ const start = async () => {
   try {
     await initDatabase();
     await memoryEngine.load();
+    await recoveryService.reconcileOrphanedToolTapeEntries();
+    resourceGuard.purgeOrphans(settings.phoenixTape.orphanGraceMs);
+    phoenixCompactor.start();
     
     app.listen(settings.api.port, settings.api.host, () => {
       console.log(`==================================================`);

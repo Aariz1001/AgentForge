@@ -1,5 +1,5 @@
 import { DataSource } from 'typeorm';
-import { Tool, ToolValidation, ExecutionLog } from './schema';
+import { Tool, ToolValidation, ExecutionLog, ToolTapeEntry, ToolTapeCompaction } from './schema';
 import { settings } from '../core/config';
 
 export const AppDataSource = new DataSource({
@@ -7,7 +7,7 @@ export const AppDataSource = new DataSource({
   url: settings.database.url,
   synchronize: settings.environment === 'development',
   logging: settings.database.echo,
-  entities: [Tool, ToolValidation, ExecutionLog],
+  entities: [Tool, ToolValidation, ExecutionLog, ToolTapeEntry, ToolTapeCompaction],
   migrations: [],
   subscribers: [],
 });

@@ -908,9 +908,36 @@ export class CopilotService implements LLMProvider {
       let fullContent = '';
       let fullReasoning = '';
 
-      // Subscribe to events
+      // Subscribe to events with a safety timeout
+      let idleTimeout: NodeJS.Timeout | null = null;
+      
       const done = new Promise<void>((resolve, reject) => {
+        const clearAndResolve = () => {
+          if (idleTimeout) clearTimeout(idleTimeout);
+          resolve();
+        };
+
+        const clearAndReject = (err: Error) => {
+          if (idleTimeout) clearTimeout(idleTimeout);
+          reject(err);
+        };
+
+        idleTimeout = setTimeout(() => {
+          if (fullContent.length > 0 || fullReasoning.length > 0) {
+            console.log(chalk.gray('\n[Copilot stream heartbeat: timeout reached, but content received. Resolving.]'));
+            clearAndResolve();
+          } else {
+            clearAndReject(new Error('Copilot stream timed out after 60s of inactivity'));
+          }
+        }, 60000);
+
         this.session.on((event: any) => {
+          // Refresh timeout on any activity
+          if (idleTimeout) {
+            clearTimeout(idleTimeout);
+            idleTimeout = setTimeout(() => clearAndResolve(), 45000); 
+          }
+
           switch (event.type) {
             case 'assistant.message_delta':
               const delta = event.data.deltaContent || '';
@@ -921,10 +948,10 @@ export class CopilotService implements LLMProvider {
               fullReasoning += event.data.deltaContent || '';
               break;
             case 'session.idle':
-              resolve();
+              clearAndResolve();
               break;
             case 'session.error':
-              reject(new Error(event.data.message || 'Session error'));
+              clearAndReject(new Error(event.data.message || 'Session error'));
               break;
           }
         });

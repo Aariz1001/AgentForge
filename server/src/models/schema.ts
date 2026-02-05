@@ -201,4 +201,101 @@ export class ExecutionLog {
   @Column('timestamp with time zone', { name: 'completed_at' })
   completedAt!: Date;
 }
+
+@Entity('tool_tape_entries')
+@Index('idx_tool_tape_idempotency_key', ['idempotencyKey'], { unique: true })
+@Index('idx_tool_tape_status', ['status'])
+@Index('idx_tool_tape_tool_hash', ['toolHash'])
+@Index('idx_tool_tape_started_at', ['startedAt'])
+export class ToolTapeEntry {
+  @PrimaryGeneratedColumn('uuid')
+  id!: string;
+
+  @Column({ name: 'tool_hash', length: 64 })
+  @Index()
+  toolHash!: string;
+
+  @Column({ name: 'run_id', length: 64 })
+  runId!: string;
+
+  @Column({ name: 'trace_id', length: 64 })
+  traceId!: string;
+
+  @Column({ name: 'step_id', length: 64 })
+  stepId!: string;
+
+  @Column({ length: 32 })
+  status!: string;
+
+  @Column({ name: 'idempotency_key', length: 128 })
+  idempotencyKey!: string;
+
+  @Column({ name: 'context_fingerprint', length: 128, nullable: true })
+  contextFingerprint?: string;
+
+  @Column({ default: false })
+  pinned!: boolean;
+
+  @Column('jsonb', { name: 'args_json', default: {} })
+  argsJson!: any;
+
+  @Column('jsonb', { name: 'result_json', nullable: true })
+  resultJson?: any;
+
+  @Column({ name: 'timeout_ms', nullable: true })
+  timeoutMs?: number;
+
+  @Column('text', { nullable: true })
+  error?: string;
+
+  @Column('timestamp with time zone', { name: 'started_at' })
+  startedAt!: Date;
+
+  @Column('timestamp with time zone', { name: 'last_used_at', nullable: true })
+  lastUsedAt?: Date;
+
+  @Column('timestamp with time zone', { name: 'finished_at', nullable: true })
+  finishedAt?: Date;
+}
+
+@Entity('tool_tape_compactions')
+@Index('idx_tool_tape_compaction_tool_hash', ['toolHash'])
+@Index('idx_tool_tape_compaction_window', ['windowStart', 'windowEnd'])
+export class ToolTapeCompaction {
+  @PrimaryGeneratedColumn('uuid')
+  id!: string;
+
+  @Column({ name: 'tool_hash', length: 64 })
+  toolHash!: string;
+
+  @Column({ name: 'context_fingerprint', length: 128, nullable: true })
+  contextFingerprint?: string;
+
+  @Column('timestamp with time zone', { name: 'window_start' })
+  windowStart!: Date;
+
+  @Column('timestamp with time zone', { name: 'window_end' })
+  windowEnd!: Date;
+
+  @Column({ name: 'total_count' })
+  totalCount!: number;
+
+  @Column({ name: 'success_count' })
+  successCount!: number;
+
+  @Column({ name: 'failure_count' })
+  failureCount!: number;
+
+  @Column({ name: 'distinct_idempotency' })
+  distinctIdempotency!: number;
+
+  @Column('text', { name: 'digest', nullable: true })
+  digest?: string;
+
+  @Column('jsonb', { name: 'summary_json', default: {} })
+  summaryJson!: any;
+
+  @CreateDateColumn({ name: 'created_at' })
+  createdAt!: Date;
+}
 // Other entities omitted for brevity but should be added in a real scenario

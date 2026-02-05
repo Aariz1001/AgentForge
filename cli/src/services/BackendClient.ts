@@ -23,7 +23,7 @@ export class BackendClient {
   constructor(config: any) {
     this.config = config;
     this.baseUrl = config.get('backend.url') || 'http://localhost:8000';
-    this.timeout = config.get('backend.timeout') ?? 60000;
+    this.timeout = config.get('backend.timeout') || 300000; // Increased to 5 minutes
     
     // Initialize provider based on config
     const activeProvider = config.get('llm.provider') || 'openrouter';
@@ -246,6 +246,23 @@ export class BackendClient {
    */
   async getSwarmRun(runId: string): Promise<any> {
     return this.request(`/swarm/run/${runId}`);
+  }
+
+  /**
+   * PhoenixTape status
+   */
+  async getPhoenixStatus(): Promise<any> {
+    return this.request('/phoenix/status');
+  }
+
+  /**
+   * Run PhoenixTape compaction
+   */
+  async runPhoenixCompaction(mode: 'full' | 'tape' | 'memory' = 'full', dryRun: boolean = false): Promise<any> {
+    return this.request('/phoenix/compact', {
+      method: 'POST',
+      body: JSON.stringify({ mode, dryRun })
+    });
   }
   
   /**

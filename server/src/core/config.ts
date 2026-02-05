@@ -127,10 +127,25 @@ const MCPSettingsSchema = z.object({
   ])
 });
 
+const PhoenixTapeSettingsSchema = z.object({
+  replayMode: z.enum(['strict', 'best_effort']).default('strict'),
+  defaultTimeoutMs: z.number().min(1000).default(30000),
+  orphanGraceMs: z.number().min(0).default(5000),
+  heapThresholdMb: z.number().min(0).default(0),
+  proceduralThreshold: z.number().min(0).max(1).default(0.85),
+  retentionDays: z.number().min(1).default(30),
+  compactionIntervalMs: z.number().min(1000).default(15 * 60 * 1000),
+  compactionWindowHours: z.number().min(1).default(24),
+  compactionMinCount: z.number().min(1).default(5),
+  compactionKeepPerTool: z.number().min(1).default(3),
+  compactionMaxDeletes: z.number().min(0).default(5000),
+  memoryCompactionIntervalMs: z.number().min(1000).default(20 * 60 * 1000)
+});
+
 const SkillsSettingsSchema = z.object({
   paths: z.array(z.string()).default([
-    'c:/Users/maari/.copilot/skills',
-    'c:/Users/maari/.claude/skills'
+    path.join(process.env.HOME || process.env.USERPROFILE || '', '.copilot/skills'),
+    path.join(process.env.HOME || process.env.USERPROFILE || '', '.claude/skills')
   ])
 });
 
@@ -148,6 +163,7 @@ const SettingsSchema = z.object({
   forge: ForgeSettingsSchema.default({}),
   swarm: SwarmSettingsSchema.default({}),
   mcp: MCPSettingsSchema.default({}),
+  phoenixTape: PhoenixTapeSettingsSchema.default({}),
   skills: SkillsSettingsSchema.default({}),
   dataDir: z.string().default('/tmp/agentforge'),
   cacheDir: z.string().default('/tmp/agentforge/cache'),

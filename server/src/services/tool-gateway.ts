@@ -5,7 +5,9 @@
  * Maintains Hot Buffer cache and PRB-based tool selection.
  */
 
+import { randomUUID } from 'crypto';
 import { DatabaseService } from './database';
+import { ToolTapeService } from './tool-tape';
 
 export interface Config {
   get(key: string): any;
@@ -36,10 +38,12 @@ export class ToolGatewayService {
   private db: DatabaseService;
   private hotBuffer: Map<string, ToolManifest>; // L1 cache
   private readonly HOT_BUFFER_SIZE = 20;
+  private toolTape?: ToolTapeService;
 
-  constructor(config: Config, db: DatabaseService) {
+  constructor(config: Config, db: DatabaseService, options: { toolTape?: ToolTapeService } = {}) {
     this.config = config;
     this.db = db;
+    this.toolTape = options.toolTape;
     this.hotBuffer = new Map();
   }
 
@@ -59,7 +63,17 @@ export class ToolGatewayService {
   /**
    * Executes a tool in an E2B sandbox
    */
-  async executeTool(toolId: string, input: any): Promise<ExecutionResult> {
+  async executeTool(
+    toolId: string,
+    input: any,
+    context: {
+      runId?: string;
+      traceId?: string;
+      stepId?: string;
+      contextFingerprint?: string;
+      volatile?: boolean;
+    } = {}
+  ): Promise<ExecutionResult> {
     const startTime = Date.now();
 
     try {
@@ -81,7 +95,23 @@ export class ToolGatewayService {
 
       // Execute in E2B sandbox (placeholder)
       const sandboxId = this.createSandboxId();
-      const result = await this.executeInSandbox(tool, input, sandboxId);
+
+      const execute = async () => this.executeInSandbox(tool, input, sandboxId);
+
+      const result = this.toolTape
+        ? await this.toolTape.getOrExecute({
+            toolHash: tool.content_hash || tool.id,
+            args: input,
+            execute,
+            context: {
+              runId: context.runId ?? 'tool-run',
+              traceId: context.traceId ?? randomUUID(),
+              stepId: context.stepId ?? toolId,
+              contextFingerprint: context.contextFingerprint,
+              volatile: context.volatile
+            }
+          }).then(r => r.result)
+        : await execute();
 
       // Update usage statistics
       await this.db.updateToolUsage(toolId);

@@ -770,7 +770,9 @@ export async function todoTool(action: string, options: any = {}): Promise<ToolR
       return taskList;
     };
 
-    if (action === 'add') {
+    const normalizedAction = action === 'create' ? 'add' : action;
+
+    if (normalizedAction === 'add') {
       const tasksToAdd = items.length > 0 ? items.map((it: any) => typeof it === 'string' ? it : it.task) : [task];
       for (const t of tasksToAdd) {
         if (t) {
@@ -780,7 +782,7 @@ export async function todoTool(action: string, options: any = {}): Promise<ToolR
           }
         }
       }
-    } else if (action === 'update' || action === 'complete') {
+    } else if (normalizedAction === 'update' || normalizedAction === 'complete') {
       const updates = items.length > 0 ? items : (id !== null ? [{ id, status: action === 'complete' ? 'completed' : status }] : []);
       const currentTasks = getTasks();
       
@@ -795,7 +797,7 @@ export async function todoTool(action: string, options: any = {}): Promise<ToolR
           }
         }
       }
-    } else if (action === 'delete') {
+    } else if (normalizedAction === 'delete') {
       const idsToDelete = items.length > 0 ? items.map((it: any) => typeof it === 'number' ? it : it.id) : (id !== null ? [id] : []);
       const currentTasks = getTasks();
       const lineIndicesToDelete = idsToDelete.map((id: any) => currentTasks.find(t => t.id === id)?.lineIndex).filter((idx: number | undefined) => idx !== undefined) as number[];

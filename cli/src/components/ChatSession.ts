@@ -17,6 +17,7 @@ import { join, resolve } from 'path';
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'fs';
 import os from 'os';
 import readline from 'readline';
+import { format as formatMessage } from 'util';
 
 import { BackendClient } from '../services/BackendClient';
 import { AgentSkill, SessionManager, SessionStats } from '../services/SessionManager';
@@ -152,6 +153,8 @@ export class ChatSession {
   private toolQueue: Array<{ type: 'tool' | 'forge'; payload: any; raw: string }> = [];
   private toolQueueRunning: boolean = false;
   private toolQueueNeedsContinuation: boolean = false;
+  private currentTurnCount: number = 0;
+  private maxTurnsPerSession: number = 50; 
   private continuationScheduled: boolean = false;
   private fatalHandlerSet: boolean = false;
   private pendingContinuation: Promise<void> | null = null;
@@ -160,6 +163,9 @@ export class ChatSession {
   private permittedTools: Set<string> = new Set();
   private pendingImage: string | null = null;
   private interrupted: boolean = false;
+  private activePrompt: readline.Interface | null = null;
+  private originalConsoleLog: typeof console.log = console.log;
+  private originalConsoleError: typeof console.error = console.error;
 
   constructor(options: any = {}) {
     this.config = options.config;
@@ -385,14 +391,11 @@ export class ChatSession {
     
     while (this.running) {
       try {
-        if (this.pendingContinuation) {
-          await this.pendingContinuation;
-        }
-        
-        // Ensure tool queue is finished before prompting for new input
-        // to avoid stdin conflicts between readline and tool permission prompts
-        while (this.toolQueueRunning || this.toolQueue.length > 0) {
-          await new Promise(resolve => setTimeout(resolve, 200));
+        // Ensure tool queue and any continuations are finished before prompting for new input
+        // This is critical to avoid stdin conflicts (eg. agent asking for tool permission while user is typing)
+        if (this.toolQueueRunning || this.toolQueue.length > 0 || this.continuationScheduled) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          continue;
         }
 
         await this.promptUser();
@@ -401,8 +404,11 @@ export class ChatSession {
           this.running = false;
           break;
         }
+        // If we get an interrupt during prompt, just restart the loop
+        if (err.message?.includes('interrupted') || err.isTtyError) {
+          continue;
+        }
         displayError('Main loop error', err.message);
-        // Wait a second to avoid tight loops on persistent errors
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
     }
@@ -418,6 +424,11 @@ export class ChatSession {
     let lastExitTime = 0;
 
     const handleExit = async () => {
+      // If a prompt is active, let it handle SIGINT (usually closes the prompt)
+      if (this.activePrompt) {
+        return; 
+      }
+
       const now = Date.now();
       
       // Reset count if more than 2 seconds have passed
@@ -429,7 +440,7 @@ export class ChatSession {
       lastExitTime = now;
 
       if (exitCount === 1) {
-        console.log(chalk.yellow('\n\n⚠ Press Ctrl+C again to exit...'));
+        process.stdout.write(chalk.yellow('\n\n⚠ Press Ctrl+C again to exit AgentForge...\n'));
       } else if (exitCount >= 2) {
         this.running = false;
         await this.showExitStats();
@@ -489,6 +500,7 @@ export class ChatSession {
       { name: 'folders', description: 'Select working folders', usage: '/folders' },
       { name: 'mcp', description: 'Manage MCP servers', usage: '/mcp [list|add|remove|connect]' },
       { name: 'skills', description: 'Manage agent skills', usage: '/skills [list|sync|add|remove|toggle]' },
+      { name: 'phoenix', description: 'PhoenixTape status/compaction', usage: '/phoenix [status|compact] [tape|memory|full] [dry]' },
       { name: 'stats', description: 'Show session statistics', usage: '/stats' },
       { name: 'swarm', description: 'Run swarm mode', usage: '/swarm <task>' },
       { name: 'cancel', description: 'Cancel current operation (ESC)', usage: '/cancel' },
@@ -546,7 +558,7 @@ export class ChatSession {
       // Regular message
       await this.sendMessage(trimmed);
     } catch (err: any) {
-      if (err.isTtyError || err.message?.includes('User force closed')) {
+      if (err.isTtyError || err.message?.includes('User force closed') || err.message?.includes('canceled') || err.message?.includes('cancelled')) {
         const stdin = process.stdin;
         const stdinClosed = !stdin || stdin.destroyed || !stdin.readable;
         displayError('Input interrupted', 'Prompt was closed; continuing...');
@@ -576,6 +588,9 @@ export class ChatSession {
         prompt: chalk.blue('▶ ')
       });
 
+      this.attachPrompt(rl);
+      this.printInputBorder('top');
+
       // Pre-populate history
       const reverseHistory = [...this.history].reverse();
       (rl as any).history = reverseHistory;
@@ -584,21 +599,59 @@ export class ChatSession {
 
       // Handle line submission
       rl.on('line', (line: string) => {
+        this.detachPrompt();
         rl.close();
         resolve(line.trim());
       });
 
       // Handle Ctrl+C
       rl.on('SIGINT', () => {
+        this.detachPrompt();
         rl.close();
         resolve('');
       });
 
       // Handle errors
       rl.on('close', () => {
-        // Already resolved in line handler
+        this.detachPrompt();
       });
     });
+  }
+
+  private attachPrompt(rl: readline.Interface): void {
+    this.activePrompt = rl;
+
+    const writeAbovePrompt = (msg: string) => {
+      if (!this.activePrompt) {
+        this.originalConsoleLog(msg);
+        return;
+      }
+
+      readline.clearLine(process.stdout, 0);
+      readline.cursorTo(process.stdout, 0);
+      process.stdout.write(msg + '\n');
+      this.activePrompt.prompt(true);
+    };
+
+    console.log = (...args: any[]) => writeAbovePrompt(formatMessage(...args));
+    console.error = (...args: any[]) => writeAbovePrompt(formatMessage(...args));
+  }
+
+  private detachPrompt(): void {
+    this.activePrompt = null;
+    console.log = this.originalConsoleLog;
+    console.error = this.originalConsoleError;
+  }
+
+  private writeOutputLine(message: string): void {
+    if (this.activePrompt) {
+      readline.clearLine(process.stdout, 0);
+      readline.cursorTo(process.stdout, 0);
+      process.stdout.write(message + '\n');
+      this.activePrompt.prompt(true);
+      return;
+    }
+    process.stdout.write(message + '\n');
   }
 
   printInputBorder(position: 'top' | 'bottom'): void {
@@ -710,6 +763,10 @@ export class ChatSession {
           await this.handleSkillsCommand(args);
           break;
 
+        case 'phoenix':
+          await this.handlePhoenixCommand(args);
+          break;
+
         case 'stats':
           this.showStats();
           break;
@@ -765,6 +822,9 @@ export class ChatSession {
       '/forge <desc>      Create a new tool\n' +
       '/skills            Manage agent skills (sync local skills)\n' +
       '/mcp               Manage MCP servers\n\n' +
+      chalk.cyan('PhoenixTape:\n') +
+      '/phoenix status    Show PhoenixTape status\n' +
+      '/phoenix compact   Run compaction (tape|memory|full)\n\n' +
       chalk.cyan('Cost & Credits:\n') +
       '/credits           Show account balance\n' +
       '/cost              Show session cost\n' +
@@ -1212,6 +1272,36 @@ export class ChatSession {
     }
   }
 
+  private async handlePhoenixCommand(args: string[]): Promise<void> {
+    const subCmd = (args[0] || 'status').toLowerCase();
+
+    if (subCmd === 'status') {
+      const status = await this.client.getPhoenixStatus();
+      const toolTape = status?.toolTape || {};
+      const statuses = toolTape.statuses || {};
+      console.log(chalk.bold('\nPhoenixTape Status:\n'));
+      console.log(`${chalk.cyan('Total entries:')} ${toolTape.total ?? 0}`);
+      for (const [key, value] of Object.entries(statuses)) {
+        console.log(`${chalk.gray(`  ${key}`)}: ${value}`);
+      }
+      console.log(`${chalk.cyan('Memory entries:')} ${status?.memory?.entries ?? 0}`);
+      console.log('');
+      return;
+    }
+
+    if (subCmd === 'compact') {
+      const mode = (args[1] || 'full').toLowerCase() as 'full' | 'tape' | 'memory';
+      const dryRun = args.includes('dry');
+      const response = await this.client.runPhoenixCompaction(mode, dryRun);
+      console.log(chalk.bold('\nPhoenixTape Compaction:\n'));
+      console.log(JSON.stringify(response?.report || {}, null, 2));
+      console.log('');
+      return;
+    }
+
+    console.log(chalk.gray('Usage: /phoenix [status|compact] [tape|memory|full] [dry]'));
+  }
+
   private async selectFolders(): Promise<void> {
     console.log(chalk.bold('\nSelect Working Folders\n'));
     
@@ -1608,12 +1698,11 @@ export class ChatSession {
   private enqueueToolExecution(item: { type: 'tool' | 'forge'; payload: any; raw: string }): void {
     this.toolQueue.push(item);
     this.toolQueueNeedsContinuation = true;
-    if (!this.toolQueueRunning) {
-      void this.processToolQueue();
-    }
+    // Trigger tool cycle immediately in background to avoid "bundling" output
+    void this.triggerToolCycle();
   }
 
-  private async processToolQueue(): Promise<void> {
+  private async triggerToolCycle(): Promise<void> {
     if (this.toolQueueRunning) return;
     this.toolQueueRunning = true;
 
@@ -1632,38 +1721,46 @@ export class ChatSession {
           displayError('Tool execution failed', error.message);
         }
       }
-
-      const shouldContinue = this.toolQueueNeedsContinuation && !this.continuationScheduled && this.running;
-      
-      if (shouldContinue) {
-        this.continuationScheduled = true;
-        this.toolQueueNeedsContinuation = false;
-        
-        // Brief pause before continuation to allow UI to settle
-        await new Promise(resolve => setTimeout(resolve, 300));
-
-        this.pendingContinuation = (async () => {
-          try {
-            await this.sendMessage('');
-          } catch (err: any) {
-            displayError('Continuation failed', err.message);
-          } finally {
-            this.continuationScheduled = false;
-            this.pendingContinuation = null;
-          }
-        })();
-        
-        await this.pendingContinuation;
-      }
-    } catch (fatalError: any) {
-      displayError('Tool queue processor fatal error', fatalError.message || 'Unknown error');
     } finally {
       this.toolQueueRunning = false;
       
-      // If more tools were enqueued during continuation, process them
-      if (this.toolQueue.length > 0 && this.running) {
-        void this.processToolQueue();
+      // If continuation is needed and nothing is running the continuation yet,
+      // and we are NOT currently in the middle of a sendMessage turn (which enqueued these tools)
+      // wait for that turn to finish before deciding on continuation.
+      // (This logic is handled by processToolQueue).
+    }
+  }
+
+  private async processToolQueue(): Promise<void> {
+    // This is the "Main" entry point for a turn's tool processing and continuation.
+    // It ensure ALL tools find in a turn are finished, then calls sendMessage('') if needed.
+    
+    // First, start the tool cycle and wait for it to be empty
+    await this.triggerToolCycle();
+    
+    // Then handle continuation if needed
+    try {
+      while (this.toolQueueNeedsContinuation && this.running && !this.continuationScheduled) {
+        this.continuationScheduled = true;
+        this.toolQueueNeedsContinuation = false;
+        
+        await new Promise(resolve => setTimeout(resolve, 300));
+        
+        try {
+          // We set continuationScheduled to false inside sendMessage if more tools arrive,
+          // or here after it finishes. Set isContinuation=true to avoid recursion.
+          await this.sendMessage('', true);
+        } catch (err: any) {
+          displayError('Continuation failed', err.message);
+        } finally {
+          this.continuationScheduled = false;
+        }
+        
+        // Wait for any tools spawned by the continuation to finish
+        await this.triggerToolCycle();
       }
+    } catch (fatalError: any) {
+      displayError('Tool queue processor fatal error', fatalError.message || 'Unknown error');
     }
   }
 
@@ -1832,7 +1929,24 @@ export class ChatSession {
     }
   }
   
-  async sendMessage(content: string): Promise<void> {
+  async sendMessage(content: string, isContinuation: boolean = false): Promise<void> {
+    if (this.activePrompt) {
+      this.detachPrompt();
+    }
+
+    if (!content) {
+      this.currentTurnCount++;
+    } else {
+      this.currentTurnCount = 0; // Reset on user input
+    }
+
+    if (this.currentTurnCount > this.maxTurnsPerSession) {
+      this.writeOutputLine(chalk.red(`\n✖ Safety termination: Maximum auto-turn limit (${this.maxTurnsPerSession}) reached.`));
+      this.writeOutputLine(chalk.yellow('  The agent might be in an infinite loop. Please check its last response.'));
+      this.currentTurnCount = 0;
+      return;
+    }
+
     if (content) {
       // Create message with current multimodal state using standard OpenAI format
       const userMsg: any = {
@@ -1879,10 +1993,19 @@ export class ChatSession {
         const reasoningOptions = reasoningConfig?.enabled ? { reasoning: reasoningConfig } : {};
 
         let result: any;
+        
+        // Add a safety timeout for the stream itself to prevent hanging
+        const streamTimeoutId = setTimeout(() => {
+          if (!result) {
+            this.writeOutputLine(chalk.yellow('\n⚠ Stream initialization is taking longer than expected...'));
+          }
+        }, 15000);
+
         try {
           result = await this.client.streamOpenRouter(
             this.messages,
             (chunk: string) => {
+              if (streamTimeoutId) clearTimeout(streamTimeoutId);
               buffer += chunk;
               streamState.rawBuffer += chunk;
               const extracted = this.extractToolBlocksFromBuffer(streamState.rawBuffer, executedToolBlocks);
@@ -1896,6 +2019,7 @@ export class ChatSession {
             { model: this.model, includeReasoningInContent: true, ...reasoningOptions }
           );
         } catch (error: any) {
+          if (streamTimeoutId) clearTimeout(streamTimeoutId);
           spinner.stop();
           
           // Detect validation errors (Zod, OpenRouter side, etc.)
@@ -1948,9 +2072,17 @@ export class ChatSession {
 
         const displayResponse = this.stripToolBlocks(response || '');
         const hadToolBlocks = executedToolBlocks.size > 0;
+        
         if (!displayResponse || displayResponse.trim().length === 0) {
           if (!hadToolBlocks) {
-            console.log(chalk.gray('[No response returned]') + '\n');
+            this.writeOutputLine(chalk.gray('[No text response returned by agent]') + '\n');
+            // If nothing returned, agent might be stuck. Trigger a small nudge if in continuation?
+            if (this.continuationScheduled) {
+               this.messages.push({ role: 'user', content: '[System: No response received. Please continue if there are pending tasks, or ask for input.]' });
+               this.toolQueueNeedsContinuation = true;
+            }
+          } else {
+            this.writeOutputLine(chalk.gray(`[Agent proceeding with ${executedToolBlocks.size} tool calls...]`) + '\n');
           }
         }
         
@@ -2051,9 +2183,15 @@ export class ChatSession {
       this.messages.push({ role: 'assistant', content: response });
       this.sessionManager.addMessage('assistant', response);
       
-      // Process any tool calls in the response
+      // Process any tool calls in the response and handle continuation loop
       try {
         await this.processToolCalls(response, executedToolBlocks);
+        
+        // Only run the tool queue manager from the top-level turn.
+        // If this is already a continuation turn, the manager is already running above us.
+        if (!isContinuation) {
+          await this.processToolQueue();
+        }
       } catch (toolProcError: any) {
         displayError('Tool processing error', toolProcError.message);
       }
@@ -2159,54 +2297,60 @@ export class ChatSession {
 
     // Permission check
     if (!this.permittedTools.has(name)) {
-      console.log('\n' + chalk.yellow('━'.repeat(60)));
-      console.log(chalk.yellow.bold('🛡️  Tool Execution Permission Request'));
-      console.log(chalk.yellow('━'.repeat(60)));
-      console.log(`${chalk.cyan('Tool:')} ${chalk.bold(name)}`);
-      
-      const argsStr = JSON.stringify(args, (k, v) => {
-        if (typeof v === 'string' && v.length > 500) return v.slice(0, 500) + '... (truncated)';
-        return v;
-      }, 2);
-      
-      console.log(`${chalk.cyan('Args:')} ${chalk.gray(argsStr.replace(/\n/g, '\n      '))}`);
-      console.log(chalk.yellow('━'.repeat(60)) + '\n');
+      const autoApprove = this.config.get('tools.autoApprove') !== false;
+      const silentPermissions = this.config.get('tools.silentPermissions') !== false;
 
-      const answer: any = await inquirer.prompt([
-        {
-          type: 'list',
-          name: 'action',
-          message: `Allow ${chalk.bold(name)} to run?`,
-          choices: [
-            { name: chalk.green('✓ yes, use this tool'), value: 'yes' },
-            { name: chalk.blue('∞ yes, use this tool and remember for the rest of the session'), value: 'always' },
-            { name: chalk.red('✗ no, and steer agentforge to guide it towards something else'), value: 'no' }
-          ]
-        }
-      ]);
-
-      if (answer.action === 'always') {
+      if (autoApprove) {
         this.permittedTools.add(name);
-      } else if (answer.action === 'no') {
-        const steering: any = await inquirer.prompt([
+      } else {
+        if (!silentPermissions) {
+          console.log('\n' + chalk.yellow('━'.repeat(60)));
+          console.log(chalk.yellow.bold('🛡️  Tool Execution Permission Request'));
+          console.log(chalk.yellow('━'.repeat(60)));
+          console.log(`${chalk.cyan('Tool:')} ${chalk.bold(name)}`);
+          console.log(chalk.yellow('━'.repeat(60)) + '\n');
+        }
+
+        const answer: any = await inquirer.prompt([
           {
-            type: 'input',
-            name: 'guidance',
-            message: chalk.yellow('Provide steering guidance:'),
-            validate: (input: string) => input.trim().length > 0 || 'Please provide instructions to the agent'
+            type: 'list',
+            name: 'action',
+            message: `Allow ${chalk.bold(name)} to run?`,
+            choices: [
+              { name: chalk.green('✓ yes, use this tool'), value: 'yes' },
+              { name: chalk.blue('∞ yes, use this tool and remember for the rest of the session'), value: 'always' },
+              { name: chalk.red('✗ no, and steer agentforge to guide it towards something else'), value: 'no' }
+            ]
           }
         ]);
 
-        console.log(chalk.yellow(`\n⚠ Execution of ${name} declined. Notifying agent with guidance...\n`));
-        this.messages.push({
-          role: 'user',
-          content: `[User declined execution of tool "${name}". Guidance: ${steering.guidance}]`
-        });
-        return;
+        if (answer.action === 'always') {
+          this.permittedTools.add(name);
+        } else if (answer.action === 'no') {
+          const steering: any = await inquirer.prompt([
+            {
+              type: 'input',
+              name: 'guidance',
+              message: chalk.yellow('Provide steering guidance:'),
+              validate: (input: string) => input.trim().length > 0 || 'Please provide instructions to the agent'
+            }
+          ]);
+
+          if (!silentPermissions) {
+            console.log(chalk.yellow(`\n⚠ Execution of ${name} declined. Notifying agent with guidance...\n`));
+          }
+          this.messages.push({
+            role: 'user',
+            content: `[User declined execution of tool "${name}". Guidance: ${steering.guidance}]`
+          });
+          return;
+        }
       }
     }
     
     try {
+      this.writeOutputLine(`  ${chalk.gray('→')} ${chalk.cyan(name)} ${chalk.gray('running...')}`);
+
       // Execute the tool with retries
       let result: any;
       const maxRetries = 2;
@@ -2325,7 +2469,7 @@ export class ChatSession {
       }
       
       // Display minimal result (tool name, target, result)
-      console.log('  ' + this.formatToolOutput(name, args, result));
+      this.writeOutputLine('  ' + this.formatToolOutput(name, args, result));
       
       // Track tool execution
       this.sessionManager.incrementToolCount();

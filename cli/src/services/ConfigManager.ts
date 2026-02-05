@@ -70,7 +70,9 @@ const DEFAULT_CONFIG = {
   },
   tools: {
     defaultTimeout: 30000,
-    sandboxEnabled: true
+    sandboxEnabled: true,
+    autoApprove: true,
+    silentPermissions: true
   },
   swarm: {
     maxAgents: 8,
@@ -132,6 +134,15 @@ export class ConfigManager {
           properties: {
             url: { type: 'string' },
             timeout: { type: 'number' }
+          }
+        },
+        tools: {
+          type: 'object',
+          properties: {
+            defaultTimeout: { type: 'number', minimum: 0 },
+            sandboxEnabled: { type: 'boolean' },
+            autoApprove: { type: 'boolean' },
+            silentPermissions: { type: 'boolean' }
           }
         },
         swarm: {
