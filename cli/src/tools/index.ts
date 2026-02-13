@@ -5,10 +5,9 @@
  * Each tool returns minimal output (1-2 lines).
  */
 
-import { exec, spawn, execSync } from 'child_process';
-import { promisify } from 'util';
+import { spawn, execSync } from 'child_process';
 import { readFile, writeFile, access, mkdir, readdir, stat } from 'fs/promises';
-import { basename, dirname, join, relative, resolve } from 'path';
+import { basename, dirname, join, relative, resolve, isAbsolute } from 'path';
 import fg from 'fast-glob';
 import chalk from 'chalk';
 import fetch from 'node-fetch';
@@ -24,7 +23,6 @@ import UpdateHeuristics from './Autonomous_Memory_Suite/UpdateHeuristics';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const execAsync = promisify(exec);
 
 // Track active background processes
 interface ActiveProcess {
@@ -33,6 +31,9 @@ interface ActiveProcess {
   output: string[];
   command: string;
   startedAt: string;
+  kind?: 'host' | 'docker';
+  containerId?: string;
+  sandbox?: 'host' | 'docker';
 }
 const activeProcesses = new Map<string, ActiveProcess>();
 let lastCommandOutput = '';
@@ -72,6 +73,210 @@ export async function spawnTerminal(options: any = {}): Promise<ToolResult> {
 let persistentProcess: any = null;
 let persistentOutput = '';
 let persistentBusy = false;
+const SHELL_SANDBOX_ROOT = resolve(process.cwd());
+const DEFAULT_SHELL_TIMEOUT_MS = 30000;
+const MAX_SHELL_TIMEOUT_MS = 300000;
+const DEFAULT_DOCKER_SANDBOX_IMAGE = process.env.AGENTFORGE_DOCKER_IMAGE || 'node:20-bookworm';
+
+const DANGEROUS_SHELL_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
+  { pattern: /(^|\s)(sudo\s+)?rm\s+-rf\s+\/(\s|$)/i, reason: 'Destructive root deletion is blocked' },
+  { pattern: /(^|\s)(sudo\s+)?mkfs(\.|\s)/i, reason: 'Filesystem formatting commands are blocked' },
+  { pattern: /(^|\s)(sudo\s+)?dd\s+if=.*\s+of=\/dev\//i, reason: 'Raw disk write commands are blocked' },
+  { pattern: /(^|\s)(shutdown|reboot|halt|poweroff)(\s|$)/i, reason: 'System power commands are blocked' },
+  { pattern: /(^|\s)diskpart(\s|$)/i, reason: 'Disk partition commands are blocked' },
+  { pattern: /(^|\s)format\s+[a-z]:/i, reason: 'Drive formatting commands are blocked' },
+  { pattern: /(^|\s)rmdir\s+\/s\s+\/q\s+[a-z]:\\/i, reason: 'Recursive drive deletion is blocked' },
+  { pattern: /(^|\s)del\s+\/f\s+\/s\s+\/q\s+[a-z]:\\/i, reason: 'Recursive force delete on drive root is blocked' },
+  { pattern: /\b(curl|wget)\b[^\n]*\|\s*(sh|bash|zsh|pwsh|powershell)\b/i, reason: 'Remote script piping is blocked' },
+  { pattern: /\b(iwr|Invoke-WebRequest)\b[^\n]*\|\s*iex\b/i, reason: 'Remote PowerShell execution is blocked' }
+];
+
+function clampShellTimeout(timeout: any): number {
+  const parsed = Number(timeout);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_SHELL_TIMEOUT_MS;
+  return Math.min(parsed, MAX_SHELL_TIMEOUT_MS);
+}
+
+function resolveDockerImage(image?: string): string {
+  const resolved = (image || DEFAULT_DOCKER_SANDBOX_IMAGE).trim();
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._/:@-]*$/.test(resolved)) {
+    throw new Error('Invalid docker image name for sandbox mode');
+  }
+  return resolved;
+}
+
+function resolveSandboxedCwd(cwd: string, options: any): string {
+  const resolvedCwd = resolve(cwd || process.cwd());
+  const allowOutsideWorkspace = options?.allowOutsideWorkspace === true || process.env.AGENTFORGE_ALLOW_OUTSIDE_WORKSPACE === '1';
+  if (allowOutsideWorkspace) return resolvedCwd;
+
+  const rel = relative(SHELL_SANDBOX_ROOT, resolvedCwd);
+  const isInside = rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  if (!isInside) {
+    throw new Error(`Sandbox violation: cwd must stay inside workspace (${SHELL_SANDBOX_ROOT})`);
+  }
+  return resolvedCwd;
+}
+
+function validateShellCommand(command: string, options: any): string {
+  if (typeof command !== 'string' || !command.trim()) {
+    throw new Error('Shell command must be a non-empty string');
+  }
+
+  const normalized = command.trim();
+  if (/\r|\n/.test(normalized)) {
+    throw new Error('Multi-line shell commands are blocked by sandbox policy');
+  }
+
+  if (normalized.length > 1200) {
+    throw new Error('Shell command too long for safe execution');
+  }
+
+  const unsafeMode = options?.unsafe === true || process.env.AGENTFORGE_SHELL_UNSAFE === '1';
+  if (!unsafeMode) {
+    for (const rule of DANGEROUS_SHELL_PATTERNS) {
+      if (rule.pattern.test(normalized)) {
+        throw new Error(`Blocked unsafe shell command: ${rule.reason}`);
+      }
+    }
+  }
+
+  return normalized;
+}
+
+async function runProcess(
+  command: string,
+  args: string[],
+  cwd: string,
+  timeoutMs: number
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  return new Promise((resolveResult, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let didTimeout = false;
+
+    const timer = setTimeout(() => {
+      didTimeout = true;
+      child.kill('SIGTERM');
+      reject(new Error(`Process timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    child.stdout?.on('data', (data: Buffer) => {
+      stdout += data.toString();
+    });
+
+    child.stderr?.on('data', (data: Buffer) => {
+      stderr += data.toString();
+    });
+
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+
+    child.on('close', (exitCode) => {
+      clearTimeout(timer);
+      if (didTimeout) return;
+      resolveResult({ stdout, stderr, exitCode: exitCode ?? 0 });
+    });
+  });
+}
+
+async function ensureDockerAvailable(): Promise<void> {
+  try {
+    const probe = await runProcess('docker', ['version', '--format', '{{.Server.Version}}'], SHELL_SANDBOX_ROOT, 15000);
+    if (probe.exitCode !== 0) {
+      throw new Error(probe.stderr || probe.stdout || 'Unknown Docker error');
+    }
+  } catch (error: any) {
+    throw new Error('Docker sandbox requested but Docker is unavailable. Start Docker Desktop and ensure `docker` works in terminal.');
+  }
+}
+
+function getDockerWorkdir(cwd: string): string {
+  const rel = relative(SHELL_SANDBOX_ROOT, cwd).replace(/\\/g, '/');
+  return rel ? `/workspace/${rel}` : '/workspace';
+}
+
+function getDockerVolumeMount(rootPath: string): string {
+  return `${rootPath.replace(/\\/g, '/')}:/workspace`;
+}
+
+async function runInDockerSandbox(
+  command: string,
+  cwd: string,
+  timeout: number,
+  dockerImage: string
+): Promise<{ output: string; exitCode: number }> {
+  const args = [
+    'run',
+    '--rm',
+    '--pull',
+    'missing',
+    '-v',
+    getDockerVolumeMount(SHELL_SANDBOX_ROOT),
+    '-w',
+    getDockerWorkdir(cwd),
+    dockerImage,
+    'sh',
+    '-lc',
+    command
+  ];
+
+  const result = await runProcess('docker', args, SHELL_SANDBOX_ROOT, timeout);
+  const combined = [result.stdout, result.stderr].filter(Boolean).join('');
+  return { output: combined, exitCode: result.exitCode };
+}
+
+async function startDockerBackgroundContainer(
+  command: string,
+  cwd: string,
+  dockerImage: string
+): Promise<{ containerId: string }> {
+  const args = [
+    'run',
+    '-d',
+    '--pull',
+    'missing',
+    '-v',
+    getDockerVolumeMount(SHELL_SANDBOX_ROOT),
+    '-w',
+    getDockerWorkdir(cwd),
+    dockerImage,
+    'sh',
+    '-lc',
+    command
+  ];
+
+  const result = await runProcess('docker', args, SHELL_SANDBOX_ROOT, 45000);
+  if (result.exitCode !== 0) {
+    throw new Error((result.stderr || result.stdout || 'Failed to start docker sandbox').trim());
+  }
+
+  const containerId = result.stdout.trim().split('\n').pop()?.trim() || '';
+  if (!containerId) {
+    throw new Error('Docker sandbox did not return a container ID');
+  }
+
+  return { containerId };
+}
+
+async function getDockerLogs(containerId: string): Promise<string> {
+  const logs = await runProcess('docker', ['logs', '--tail', '200', containerId], SHELL_SANDBOX_ROOT, 15000);
+  return [logs.stdout, logs.stderr].filter(Boolean).join('');
+}
+
+async function isDockerContainerRunning(containerId: string): Promise<boolean> {
+  const result = await runProcess('docker', ['ps', '-q', '-f', `id=${containerId}`], SHELL_SANDBOX_ROOT, 15000);
+  return result.stdout.trim().length > 0;
+}
 
 /**
  * Executes a command in a persistent shell session
@@ -86,7 +291,9 @@ async function runInPersistentShell(command: string, cwd: string, timeout: numbe
   try {
     if (!persistentProcess || persistentProcess.killed) {
       const shellCmd = process.platform === 'win32' ? 'pwsh.exe' : 'bash';
-      const shellArgs = process.platform === 'win32' ? ['-NoLogo', '-NoExit', '-Command', '-'] : ['-i'];
+      const shellArgs = process.platform === 'win32'
+        ? ['-NoLogo', '-NoProfile', '-NoExit', '-Command', '-']
+        : ['--noprofile', '--norc'];
       
       persistentProcess = spawn(shellCmd, shellArgs, {
         cwd: resolve(cwd),
@@ -351,40 +558,115 @@ export async function write(filePath: string, content: string, options: any = {}
 export async function shell(command: string, options: any = {}): Promise<ToolResult> {
   const {
     cwd = process.cwd(),
-    timeout = 30000,
+    timeout = DEFAULT_SHELL_TIMEOUT_MS,
     showOutput = false,
-    isBackground = false
+    isBackground = false,
+    unsafe = false,
+    allowOutsideWorkspace = false,
+    sandbox = process.env.AGENTFORGE_SHELL_SANDBOX || 'docker',
+    dockerImage = DEFAULT_DOCKER_SANDBOX_IMAGE
   } = options;
   
   try {
-    let finalCommand = command;
+    const safeCommand = validateShellCommand(command, { unsafe });
+    const safeCwd = resolveSandboxedCwd(cwd, { allowOutsideWorkspace });
+    const safeTimeout = clampShellTimeout(timeout);
+    const resolvedSandbox = String(sandbox).toLowerCase();
+    if (!['host', 'docker'].includes(resolvedSandbox)) {
+      return new ToolResult(false, `Unsupported sandbox option: ${sandbox}. Use "host" or "docker".`);
+    }
+
+    if (resolvedSandbox === 'docker') {
+      await ensureDockerAvailable();
+      const image = resolveDockerImage(dockerImage);
+
+      if (isBackground) {
+        const { containerId } = await startDockerBackgroundContainer(safeCommand, safeCwd, image);
+        const procId = `proc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        activeProcesses.set(procId, {
+          id: procId,
+          process: null,
+          output: [],
+          command: safeCommand,
+          startedAt: new Date().toISOString(),
+          kind: 'docker',
+          containerId,
+          sandbox: 'docker'
+        });
+
+        return new ToolResult(true,
+          `Started docker sandbox process ${chalk.cyan(procId)} using ${chalk.gray(image)}`,
+          { procId, command, sandbox: 'docker', dockerImage: image, containerId }
+        );
+      }
+
+      const { output, exitCode } = await runInDockerSandbox(safeCommand, safeCwd, safeTimeout, image);
+      lastCommandOutput = output;
+      const lines = output.trim() ? output.trim().split('\n').length : 0;
+
+      if (exitCode === 0) {
+        return new ToolResult(true,
+          `${chalk.gray('$')} ${chalk.bold(command.slice(0, 50))}${command.length > 50 ? '...' : ''} → ${chalk.green('Exit 0')} ${chalk.gray('[docker]')}`,
+          {
+            command,
+            exitCode: 0,
+            output: showOutput ? output : `(${lines} lines)`,
+            fullOutput: output,
+            lines,
+            sandboxed: true,
+            sandbox: 'docker',
+            cwd: safeCwd,
+            dockerImage: image
+          }
+        );
+      }
+
+      return new ToolResult(false,
+        `${chalk.gray('$')} ${chalk.bold(command.slice(0, 50))} → ${chalk.red(`Exit ${exitCode}`)} ${chalk.gray('[docker]')}`,
+        {
+          command,
+          exitCode,
+          error: exitCode === -1 ? 'Command timed out' : `Command failed with exit code ${exitCode}`,
+          output: output.slice(-2000),
+          fullOutput: output,
+          sandboxed: true,
+          sandbox: 'docker',
+          cwd: safeCwd,
+          dockerImage: image
+        }
+      );
+    }
+
+    let finalCommand = safeCommand;
     
     // Windows compatibility: translate common Linux commands
     if (process.platform === 'win32') {
-      if (command.startsWith('ls ')) {
-        finalCommand = command.replace(/^ls\s+/, 'dir /B ');
-      } else if (command === 'ls') {
+      if (safeCommand.startsWith('ls ')) {
+        finalCommand = safeCommand.replace(/^ls\s+/, 'dir /B ');
+      } else if (safeCommand === 'ls') {
         finalCommand = 'dir /B';
-      } else if (command.startsWith('cat ')) {
-        finalCommand = command.replace(/^cat\s+/, 'type ');
-      } else if (command.startsWith('rm -rf ')) {
-        finalCommand = command.replace(/^rm\s+-rf\s+/, 'rmdir /S /Q ');
-      } else if (command.startsWith('rm ')) {
-        finalCommand = command.replace(/^rm\s+/, 'del /Q ');
-      } else if (command.startsWith('cp ')) {
-        finalCommand = command.replace(/^cp\s+/, 'copy ');
-      } else if (command.startsWith('mv ')) {
-        finalCommand = command.replace(/^mv\s+/, 'move ');
+      } else if (safeCommand.startsWith('cat ')) {
+        finalCommand = safeCommand.replace(/^cat\s+/, 'type ');
+      } else if (safeCommand.startsWith('rm -rf ')) {
+        finalCommand = safeCommand.replace(/^rm\s+-rf\s+/, 'rmdir /S /Q ');
+      } else if (safeCommand.startsWith('rm ')) {
+        finalCommand = safeCommand.replace(/^rm\s+/, 'del /Q ');
+      } else if (safeCommand.startsWith('cp ')) {
+        finalCommand = safeCommand.replace(/^cp\s+/, 'copy ');
+      } else if (safeCommand.startsWith('mv ')) {
+        finalCommand = safeCommand.replace(/^mv\s+/, 'move ');
       }
     }
 
     if (isBackground) {
       const procId = `proc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-      const shellCmd = process.platform === 'win32' ? 'cmd.exe' : 'sh';
-      const shellArgs = process.platform === 'win32' ? ['/c', finalCommand] : ['-c', finalCommand];
+      const shellCmd = process.platform === 'win32' ? 'pwsh.exe' : 'bash';
+      const shellArgs = process.platform === 'win32'
+        ? ['-NoLogo', '-NoProfile', '-Command', finalCommand]
+        : ['--noprofile', '--norc', '-c', finalCommand];
 
       const child = spawn(shellCmd, shellArgs, {
-        cwd: resolve(cwd),
+        cwd: safeCwd,
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe']
       });
@@ -393,7 +675,7 @@ export async function shell(command: string, options: any = {}): Promise<ToolRes
         id: procId,
         process: child,
         output: [],
-        command,
+        command: safeCommand,
         startedAt: new Date().toISOString()
       };
       activeProcesses.set(procId, entry);
@@ -409,11 +691,11 @@ export async function shell(command: string, options: any = {}): Promise<ToolRes
 
       return new ToolResult(true, 
         `Started background process ${chalk.cyan(procId)}: ${chalk.bold(command.slice(0, 30))}`,
-        { procId, command }
+        { procId, command, sandbox: 'host' }
       );
     }
 
-    const { output, exitCode } = await runInPersistentShell(finalCommand, cwd, timeout);
+    const { output, exitCode } = await runInPersistentShell(finalCommand, safeCwd, safeTimeout);
     
     lastCommandOutput = output; 
     const lines = output.trim().split('\n').length;
@@ -426,7 +708,10 @@ export async function shell(command: string, options: any = {}): Promise<ToolRes
           exitCode: 0, 
           output: showOutput ? output : `(${lines} lines)`,
           fullOutput: output,
-          lines
+          lines,
+          sandboxed: true,
+          sandbox: 'host',
+          cwd: safeCwd
         }
       );
     } else {
@@ -437,7 +722,10 @@ export async function shell(command: string, options: any = {}): Promise<ToolRes
           exitCode, 
           error: exitCode === -1 ? 'Command timed out' : `Command failed with exit code ${exitCode}`,
           output: output.slice(-2000),
-          fullOutput: output
+          fullOutput: output,
+          sandboxed: true,
+          sandbox: 'host',
+          cwd: safeCwd
         }
       );
     }
@@ -458,6 +746,15 @@ export async function shellKill(procId: string): Promise<ToolResult> {
   if (!entry) return new ToolResult(false, `Process not found: ${procId}`);
 
   try {
+    if (entry.kind === 'docker' && entry.containerId) {
+      const killResult = await runProcess('docker', ['rm', '-f', entry.containerId], SHELL_SANDBOX_ROOT, 20000);
+      if (killResult.exitCode !== 0) {
+        return new ToolResult(false, `Failed to kill docker sandbox process: ${(killResult.stderr || killResult.stdout).trim()}`);
+      }
+      activeProcesses.delete(procId);
+      return new ToolResult(true, `Killed docker sandbox process ${chalk.cyan(procId)} (${entry.command})`);
+    }
+
     if (process.platform === 'win32') {
       execSync(`taskkill /pid ${entry.process.pid} /T /F`).toString();
     } else {
@@ -553,6 +850,22 @@ export async function shellOutput(options: any = {}): Promise<ToolResult> {
 
   const entry = activeProcesses.get(procId);
   if (!entry) return new ToolResult(false, `Process not found: ${procId}`);
+
+  if (entry.kind === 'docker' && entry.containerId) {
+    try {
+      const output = await getDockerLogs(entry.containerId);
+      const isRunning = await isDockerContainerRunning(entry.containerId);
+      return new ToolResult(true, `Retrieved output for docker sandbox process ${chalk.cyan(procId)}`, {
+        command: entry.command,
+        output: output.slice(-5000),
+        isFinished: !isRunning,
+        sandbox: 'docker',
+        containerId: entry.containerId
+      });
+    } catch (error: any) {
+      return new ToolResult(false, `Failed to read docker sandbox output: ${error.message}`);
+    }
+  }
 
   const output = entry.output.join('');
   return new ToolResult(true, `Retrieved output for process ${chalk.cyan(procId)}`, {
@@ -687,7 +1000,7 @@ export async function packageTool(action: string, packages: any, options: any = 
  * Diagnostic Tool - Check for syntax and type errors
  */
 export async function checkTool(path: string = '.', options: any = {}): Promise<ToolResult> {
-  const { type = 'auto' } = options;
+  const { type = 'auto', sandbox = process.env.AGENTFORGE_SHELL_SANDBOX || 'docker' } = options;
   
   try {
     const absolutePath = resolve(path);
@@ -720,20 +1033,32 @@ export async function checkTool(path: string = '.', options: any = {}): Promise<
       return new ToolResult(false, `No diagnostic command discovered for ${checkMode}`);
     }
     
-    try {
-      const { stdout, stderr } = await execAsync(command, { cwd: absolutePath, timeout: 60000 });
-      return new ToolResult(true, `No errors found in ${chalk.cyan(path)}`, { output: stdout + stderr });
-    } catch (error: any) {
-      const output = (error.stdout || '') + (error.stderr || '');
-      // Try to count errors
-      const errorMatches = output.match(/error|failed|fault/gi);
-      const errorCount = errorMatches ? errorMatches.length : 'some';
-      
-      return new ToolResult(false, 
-        `Found ${chalk.red(errorCount)} issues in ${chalk.cyan(path)}`,
-        { output, exitCode: error.code || 1 }
-      );
+    const shellResult = await shell(command, {
+      cwd: absolutePath,
+      timeout: 60000,
+      sandbox,
+      showOutput: true
+    });
+
+    if (shellResult.success) {
+      return new ToolResult(true, `No errors found in ${chalk.cyan(path)}`, {
+        output: shellResult.data?.fullOutput || shellResult.data?.output || '',
+        sandbox: shellResult.data?.sandbox || sandbox
+      });
     }
+
+    const output = shellResult.data?.fullOutput || shellResult.data?.output || '';
+    const errorMatches = String(output).match(/error|failed|fault/gi);
+    const errorCount = errorMatches ? errorMatches.length : 'some';
+
+    return new ToolResult(false,
+      `Found ${chalk.red(errorCount)} issues in ${chalk.cyan(path)}`,
+      {
+        output,
+        exitCode: shellResult.data?.exitCode || 1,
+        sandbox: shellResult.data?.sandbox || sandbox
+      }
+    );
   } catch (error: any) {
     return new ToolResult(false, `Diagnostics failed: ${error.message}`);
   }
@@ -1284,12 +1609,16 @@ const staticTools: Record<string, any> = {
   },
   shell: {
     name: 'shell',
-    description: 'Execute shell commands',
+    description: 'Execute shell commands in a workspace sandbox with safety checks',
     parameters: {
       command: { type: 'string', required: true },
       cwd: { type: 'string', default: '.' },
       timeout: { type: 'number', default: 30000 },
-      isBackground: { type: 'boolean', default: false, description: 'Run in background without blocking' }
+      isBackground: { type: 'boolean', default: false, description: 'Run in background without blocking' },
+      sandbox: { type: 'string', default: 'host', description: 'Execution sandbox: "host" or "docker"' },
+      dockerImage: { type: 'string', default: DEFAULT_DOCKER_SANDBOX_IMAGE, description: 'Docker image used when sandbox is "docker"' },
+      unsafe: { type: 'boolean', default: false, description: 'Disable dangerous-command blocking (not recommended)' },
+      allowOutsideWorkspace: { type: 'boolean', default: false, description: 'Allow cwd outside workspace sandbox root' }
     },
     execute: shell
   },

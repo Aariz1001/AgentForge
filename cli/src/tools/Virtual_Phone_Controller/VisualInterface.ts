@@ -16,8 +16,8 @@ interface Coordinates {
 }
 
 interface VisualInterfaceArgs {
-  deviceId: string;
-  action: 'tap' | 'swipe' | 'text' | 'keyevent' | 'screenshot' | 'dump_hierarchy' | 'get_resolution' | 'tap_by_text' | 'wait_for_element';
+  deviceId?: string;
+  action: 'tap' | 'swipe' | 'text' | 'keyevent' | 'screenshot' | 'dump_hierarchy' | 'get_resolution' | 'tap_by_text' | 'wait_for_element' | 'snapshot' | 'context_snapshot' | 'click' | 'type_text' | 'press' | 'hierarchy';
   coordinates?: Coordinates;
   startCoords?: Coordinates;
   endCoords?: Coordinates;
@@ -31,6 +31,19 @@ interface VisualInterfaceArgs {
     height: number;
   };
   timeout?: number;
+  textMatchMode?: 'exact' | 'contains' | 'regex';
+  occurrenceIndex?: number;
+  ignoreCase?: boolean;
+  returnMatches?: boolean;
+  includeHierarchy?: boolean;
+  includeResolution?: boolean;
+}
+
+interface HierarchyMatch {
+  center: Coordinates;
+  bounds: string;
+  text?: string;
+  contentDesc?: string;
 }
 
 async function parseBounds(boundsStr: string): Promise<Coordinates> {
@@ -59,6 +72,86 @@ async function captureHierarchy(deviceId: string, timeout: number): Promise<stri
       await executeAdbCommand(deviceId, ['shell', 'rm', remotePath], 5000);
     } catch {}
   }
+}
+
+async function resolveDeviceId(preferredDeviceId?: string, timeout: number = 10000): Promise<{ deviceId?: string; error?: string; available?: string[] }> {
+  if (preferredDeviceId) {
+    return { deviceId: preferredDeviceId };
+  }
+
+  const { stdout } = await execAsync('adb devices', { timeout });
+  const lines = stdout
+    .split('\n')
+    .slice(1)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => line.split('\t'))
+    .filter(parts => parts.length >= 2 && parts[1] === 'device')
+    .map(parts => parts[0]);
+
+  if (lines.length === 1) {
+    return { deviceId: lines[0] };
+  }
+
+  if (lines.length === 0) {
+    return { error: 'No authorized device detected. Connect a device or start an emulator.', available: [] };
+  }
+
+  return {
+    error: `deviceId is required because ${lines.length} devices are connected: ${lines.join(', ')}`,
+    available: lines,
+  };
+}
+
+function escapeRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeAction(action: VisualInterfaceArgs['action']): 'tap' | 'swipe' | 'text' | 'keyevent' | 'screenshot' | 'dump_hierarchy' | 'get_resolution' | 'tap_by_text' | 'wait_for_element' | 'context_snapshot' {
+  if (action === 'click') return 'tap';
+  if (action === 'type_text') return 'text';
+  if (action === 'press') return 'keyevent';
+  if (action === 'hierarchy') return 'dump_hierarchy';
+  if (action === 'snapshot') return 'context_snapshot';
+  return action;
+}
+
+async function findHierarchyMatches(
+  xml: string,
+  targetText: string,
+  mode: 'exact' | 'contains' | 'regex',
+  ignoreCase: boolean
+): Promise<HierarchyMatch[]> {
+  const matches: HierarchyMatch[] = [];
+  const nodeRegex = /<node\b[^>]*>/g;
+  const pattern = mode === 'regex'
+    ? new RegExp(targetText, ignoreCase ? 'i' : '')
+    : new RegExp(mode === 'exact' ? `^${escapeRegex(targetText)}$` : escapeRegex(targetText), ignoreCase ? 'i' : '');
+
+  let nodeMatch: RegExpExecArray | null;
+  while ((nodeMatch = nodeRegex.exec(xml)) !== null) {
+    const node = nodeMatch[0];
+    const boundsMatch = node.match(/bounds="([^"]+)"/i);
+    if (!boundsMatch) continue;
+
+    const textMatch = node.match(/text="([^"]*)"/i);
+    const descMatch = node.match(/content-desc="([^"]*)"/i);
+    const nodeText = textMatch?.[1] || '';
+    const nodeDesc = descMatch?.[1] || '';
+
+    const isMatch = pattern.test(nodeText) || pattern.test(nodeDesc);
+    if (!isMatch) continue;
+
+    const center = await parseBounds(boundsMatch[1]);
+    matches.push({
+      center,
+      bounds: boundsMatch[1],
+      text: nodeText,
+      contentDesc: nodeDesc,
+    });
+  }
+
+  return matches;
 }
 
 async function executeAdbCommand(
@@ -182,8 +275,8 @@ async function captureScreenshotToBase64(deviceId: string, timeout: number): Pro
 
 export async function VisualInterface(args: VisualInterfaceArgs): Promise<ToolResult> {
   const {
-    deviceId,
-    action,
+    deviceId: requestedDeviceId,
+    action: requestedAction,
     coordinates,
     startCoords,
     endCoords,
@@ -193,12 +286,16 @@ export async function VisualInterface(args: VisualInterfaceArgs): Promise<ToolRe
     duration = 300,
     captureScreenshot = false,
     resolution,
-    timeout = 30000
+    timeout = 30000,
+    textMatchMode = 'exact',
+    occurrenceIndex = 0,
+    ignoreCase = true,
+    returnMatches = false,
+    includeHierarchy = true,
+    includeResolution = true,
   } = args;
 
-  if (!deviceId) {
-    return new ToolResult(false, 'Device ID is required');
-  }
+  const action = normalizeAction(requestedAction);
   
   if (!action) {
     return new ToolResult(false, 'Action is required');
@@ -213,6 +310,14 @@ export async function VisualInterface(args: VisualInterfaceArgs): Promise<ToolRe
       return new ToolResult(false, 'ADB not found. Please install Android SDK and ensure adb is in PATH');
     }
 
+    const resolvedDevice = await resolveDeviceId(requestedDeviceId, Math.min(timeout, 15000));
+    if (!resolvedDevice.deviceId) {
+      return new ToolResult(false, resolvedDevice.error || 'Unable to resolve deviceId', {
+        availableDevices: resolvedDevice.available || []
+      });
+    }
+    const deviceId = resolvedDevice.deviceId;
+
     const state = await checkDeviceState(deviceId, timeout);
     if (state === 'offline') {
       return new ToolResult(false, `Device ${deviceId} is offline or not connected`);
@@ -224,7 +329,19 @@ export async function VisualInterface(args: VisualInterfaceArgs): Promise<ToolRe
       return new ToolResult(false, `Device ${deviceId} is still booting. Please wait for boot completion`);
     }
 
-    let resultData: any = {};
+    let resultData: any = {
+      action,
+      deviceId,
+      requestedAction,
+      matchedBy: action === 'tap_by_text' || action === 'wait_for_element'
+        ? { mode: textMatchMode, ignoreCase, occurrenceIndex }
+        : undefined,
+      capabilities: {
+        aliases: ['click→tap', 'type_text→text', 'press→keyevent', 'snapshot→context_snapshot'],
+        autoDeviceResolution: true,
+        textMatching: ['exact', 'contains', 'regex']
+      }
+    };
     let actionMessage = '';
 
     switch (action) {
@@ -282,6 +399,7 @@ export async function VisualInterface(args: VisualInterfaceArgs): Promise<ToolRe
       case 'dump_hierarchy': {
         const xml = await captureHierarchy(deviceId, timeout);
         resultData.hierarchy = xml;
+        resultData.hierarchyLength = xml.length;
         actionMessage = 'UI hierarchy dumped successfully';
         break;
       }
@@ -304,19 +422,31 @@ export async function VisualInterface(args: VisualInterfaceArgs): Promise<ToolRe
           return new ToolResult(false, 'targetText required for tap_by_text action');
         }
         const xml = await captureHierarchy(deviceId, timeout);
-        // Look for text="..." or content-desc="..."
-        const textPattern = new RegExp(`text="${targetText}"[^>]*bounds="([^"]+)"`, 'i');
-        const descPattern = new RegExp(`content-desc="${targetText}"[^>]*bounds="([^"]+)"`, 'i');
-        
-        const match = xml.match(textPattern) || xml.match(descPattern);
-        if (!match) {
-          return new ToolResult(false, `Could not find element with text or description: "${targetText}"`);
+        const matches = await findHierarchyMatches(xml, targetText, textMatchMode, ignoreCase);
+
+        if (matches.length === 0) {
+          return new ToolResult(false, `Could not find element with text/description matching "${targetText}"`, {
+            targetText,
+            mode: textMatchMode,
+            ignoreCase,
+          });
         }
-        
-        const center = await parseBounds(match[1]);
+
+        const selectedIndex = Math.max(0, Math.min(occurrenceIndex, matches.length - 1));
+        const chosen = matches[selectedIndex];
+        const center = chosen.center;
+
         await executeAdbCommand(deviceId, ['shell', 'input', 'tap', center.x.toString(), center.y.toString()], timeout);
-        actionMessage = `Found and tapped "${targetText}" at (${center.x}, ${center.y})`;
+        actionMessage = `Found and tapped "${targetText}" at (${center.x}, ${center.y}) [match ${selectedIndex + 1}/${matches.length}]`;
         resultData.coordinates = center;
+        resultData.matchCount = matches.length;
+        resultData.selectedMatch = {
+          index: selectedIndex,
+          ...chosen,
+        };
+        if (returnMatches) {
+          resultData.matches = matches;
+        }
         break;
       }
 
@@ -327,22 +457,55 @@ export async function VisualInterface(args: VisualInterfaceArgs): Promise<ToolRe
         const maxWait = timeout || 30000;
         const start = Date.now();
         let found = false;
+        let foundMatches: HierarchyMatch[] = [];
         
         actionMessage = `Waiting for element "${targetText}"...`;
         
         while (Date.now() - start < maxWait) {
           const xml = await captureHierarchy(deviceId, 5000);
-          if (xml.toLowerCase().includes(targetText.toLowerCase())) {
+          const matches = await findHierarchyMatches(xml, targetText, textMatchMode, ignoreCase);
+          if (matches.length > 0) {
             found = true;
+            foundMatches = matches;
             break;
           }
           await new Promise(r => setTimeout(r, 2000));
         }
         
         if (!found) {
-          return new ToolResult(false, `Timed out waiting for element: "${targetText}"`);
+          return new ToolResult(false, `Timed out waiting for element: "${targetText}"`, {
+            elapsedMs: Date.now() - start,
+            timeoutMs: maxWait,
+            mode: textMatchMode,
+            ignoreCase,
+          });
         }
-        actionMessage = `Element "${targetText}" appeared on screen`;
+        actionMessage = `Element "${targetText}" appeared on screen (${foundMatches.length} match(es))`;
+        resultData.elapsedMs = Date.now() - start;
+        resultData.matchCount = foundMatches.length;
+        if (returnMatches) {
+          resultData.matches = foundMatches;
+        }
+        break;
+      }
+
+      case 'context_snapshot': {
+        if (includeResolution) {
+          const { stdout } = await executeAdbCommand(deviceId, ['shell', 'wm', 'size'], timeout);
+          const match = stdout.match(/Physical size: (\d+)x(\d+)/);
+          if (match) {
+            resultData.width = parseInt(match[1], 10);
+            resultData.height = parseInt(match[2], 10);
+          }
+        }
+
+        if (includeHierarchy) {
+          const xml = await captureHierarchy(deviceId, timeout);
+          resultData.hierarchy = xml;
+          resultData.hierarchyLength = xml.length;
+        }
+
+        actionMessage = 'Device context snapshot captured';
         break;
       }
       
@@ -364,6 +527,8 @@ export async function VisualInterface(args: VisualInterfaceArgs): Promise<ToolRe
       }
     }
 
+    resultData.completedAt = new Date().toISOString();
+
     return new ToolResult(true, actionMessage, resultData);
     
   } catch (error: any) {
@@ -377,12 +542,12 @@ export async function VisualInterface(args: VisualInterfaceArgs): Promise<ToolRe
 (VisualInterface as any).parameters = {
   deviceId: {
     type: "string",
-    description: "ADB device serial identifier (e.g., 'emulator-5554' or physical device serial)",
-    required: true
+    description: "ADB device serial identifier. Optional if exactly one authorized device is connected.",
+    required: false
   },
   action: {
     type: "string",
-    description: "UI automation action: 'tap', 'swipe', 'text', 'keyevent', 'screenshot', 'dump_hierarchy', 'get_resolution', 'tap_by_text', or 'wait_for_element'",
+    description: "UI automation action: tap/swipe/text/keyevent/screenshot/dump_hierarchy/get_resolution/tap_by_text/wait_for_element/context_snapshot with aliases click/type_text/press/hierarchy/snapshot",
     required: true
   },
   coordinates: {
@@ -410,6 +575,26 @@ export async function VisualInterface(args: VisualInterfaceArgs): Promise<ToolRe
     description: "String to search for in 'tap_by_text' or 'wait_for_element' actions.",
     required: false
   },
+  textMatchMode: {
+    type: "string",
+    description: "Text matching mode for tap_by_text/wait_for_element: exact, contains, or regex (default: exact)",
+    required: false
+  },
+  occurrenceIndex: {
+    type: "number",
+    description: "Select which matching element to target (0-based index, default: 0)",
+    required: false
+  },
+  ignoreCase: {
+    type: "boolean",
+    description: "Case-insensitive text matching (default: true)",
+    required: false
+  },
+  returnMatches: {
+    type: "boolean",
+    description: "Return all matched hierarchy candidates for debugging/planning",
+    required: false
+  },
   keyCode: {
     type: "string",
     description: "Android keyevent code (e.g., 'KEYCODE_ENTER', 'KEYCODE_BACK', 'KEYCODE_HOME')",
@@ -433,6 +618,16 @@ export async function VisualInterface(args: VisualInterfaceArgs): Promise<ToolRe
   timeout: {
     type: "number",
     description: "Command timeout in milliseconds (default: 30000)",
+    required: false
+  },
+  includeHierarchy: {
+    type: "boolean",
+    description: "For context_snapshot: include UI hierarchy XML (default: true)",
+    required: false
+  },
+  includeResolution: {
+    type: "boolean",
+    description: "For context_snapshot: include screen resolution (default: true)",
     required: false
   }
 };

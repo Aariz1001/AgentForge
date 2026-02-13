@@ -50,7 +50,8 @@ const DEFAULT_CONFIG = {
       maxMessages: 80,
       keepLast: 20,
       summaryModel: '',
-      summaryMaxTokens: 800
+      summaryMaxTokens: 800,
+      summaryMaxInputChars: 50000
     }
   },
   // GitHub Copilot settings (for Pro/Pro+ subscribers)
@@ -124,7 +125,8 @@ export class ConfigManager {
                 maxMessages: { type: 'number', minimum: 10 },
                 keepLast: { type: 'number', minimum: 5 },
                 summaryModel: { type: 'string' },
-                summaryMaxTokens: { type: 'number', minimum: 128 }
+                summaryMaxTokens: { type: 'number', minimum: 128 },
+                summaryMaxInputChars: { type: 'number', minimum: 1000 }
               }
             }
           }

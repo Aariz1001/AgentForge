@@ -205,10 +205,20 @@ app.post('/memory/consolidate', (_req: Request, res: Response) => {
 // PhoenixTape Management
 app.get('/phoenix/status', async (_req: Request, res: Response) => {
   const stats = await toolTape.getStats();
+  const runtime = phoenixCompactor.getRuntimeStatus();
   res.json({
     toolTape: stats,
     memory: {
       entries: memoryEngine.list().length
+    },
+    compactor: runtime,
+    settings: {
+      retentionDays: settings.phoenixTape.retentionDays,
+      compactionWindowHours: settings.phoenixTape.compactionWindowHours,
+      compactionMinCount: settings.phoenixTape.compactionMinCount,
+      compactionKeepPerTool: settings.phoenixTape.compactionKeepPerTool,
+      compactionMaxDeletes: settings.phoenixTape.compactionMaxDeletes,
+      replayMode: settings.phoenixTape.replayMode
     }
   });
 });
@@ -216,14 +226,29 @@ app.get('/phoenix/status', async (_req: Request, res: Response) => {
 app.post('/phoenix/compact', async (req: Request, res: Response) => {
   const { mode = 'full', dryRun = false } = req.body || {};
   try {
+    if (!['full', 'tape', 'memory'].includes(mode)) {
+      return res.status(400).json({ error: `Invalid mode: ${mode}. Expected one of: full, tape, memory` });
+    }
+
     const report: any = {};
     if (mode === 'full' || mode === 'tape') {
       report.tape = await phoenixCompactor.runTapeCompaction({ dryRun });
     }
     if (mode === 'full' || mode === 'memory') {
-      report.memory = await phoenixCompactor.runMemoryCompaction();
+      if (dryRun) {
+        report.memory = {
+          clusters: 0,
+          summariesCreated: 0,
+          deleted: 0,
+          retained: memoryEngine.list().length,
+          dryRun: true,
+          skippedReason: 'dry_run_not_supported_for_memory'
+        };
+      } else {
+        report.memory = await phoenixCompactor.runMemoryCompaction();
+      }
     }
-    res.json({ report });
+    res.json({ report, dryRun });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

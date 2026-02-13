@@ -26,6 +26,11 @@ import { loadForgedTools } from './tools/index';
 
 const VERSION = '1.0.0';
 
+function getPanelWidth(min = 72, max = 104, margin = 4): number {
+  const cols = process.stdout.columns || 100;
+  return Math.min(max, Math.max(min, cols - margin));
+}
+
 // Initialize CLI
 const program = new Command();
 
@@ -254,6 +259,9 @@ program
       } else {
         console.log(chalk.red(`Unknown provider: ${provider}`));
         console.log(chalk.gray('Available providers: openrouter, copilot'));
+        console.log(chalk.gray('Examples:'));
+        console.log(chalk.gray('  agentforge provider --login openrouter'));
+        console.log(chalk.gray('  agentforge provider --login copilot'));
       }
     } else if (options.logout) {
       const provider = options.logout.toLowerCase();
@@ -314,7 +322,14 @@ program
     if (options.setup) {
       await runSetupWizard(config);
     } else if (options.set) {
-      const [key, value] = options.set.split('=');
+      const eqIndex = options.set.indexOf('=');
+      if (eqIndex <= 0) {
+        console.log(chalk.red('Invalid format for --set. Expected: key=value'));
+        console.log(chalk.gray('Example: agentforge config --set openrouter.model=anthropic/claude-sonnet-4'));
+        return;
+      }
+      const key = options.set.slice(0, eqIndex).trim();
+      const value = options.set.slice(eqIndex + 1).trim();
       config.set(key, value);
       console.log(chalk.green(`✓ Set ${key}`));
     } else if (options.get) {
@@ -348,7 +363,8 @@ program
       console.log(boxen(result.summary || result.output, {
         padding: 1,
         borderColor: 'green',
-        title: 'Result'
+        title: 'Result',
+        width: getPanelWidth(72, 108)
       }));
     } catch (error: any) {
       spinner.fail('Task failed');
@@ -366,12 +382,24 @@ program
     const providerManager = new ProviderManager(config);
     
     console.log(chalk.bold('\n📊 AgentForge Status\n'));
+
+    const shellSandbox = process.env.AGENTFORGE_SHELL_SANDBOX || 'docker';
+    const backendUrl = config.get('backend.url') || 'http://localhost:8000';
+    const activeProviderType = providerManager.getActiveProviderType();
+    console.log(boxen(
+      chalk.white('Environment') + '\n\n' +
+      chalk.gray('Provider: ') + chalk.cyan(activeProviderType) + '\n' +
+      chalk.gray('Backend:  ') + chalk.cyan(backendUrl) + '\n' +
+      chalk.gray('Sandbox:  ') + chalk.cyan(shellSandbox),
+      { padding: 1, borderColor: 'cyan', width: getPanelWidth(72, 96) }
+    ));
     
     // Show provider status
     await providerManager.displayStatus();
     
     const checks = [
       { name: 'Backend API', check: () => client.healthCheck() },
+      { name: 'Active Provider Ready', check: async () => providerManager.getActiveProvider().isAvailable() },
       { name: 'Configuration', check: () => !!config.get('openrouter.apiKey') || !!config.get('llm.provider') }
     ];
     
@@ -388,67 +416,109 @@ program
         spinner.fail(chalk.red(name + ` (${error.message})`));
       }
     }
+
+    console.log(chalk.gray('Quick actions:'));
+    console.log(chalk.gray('  • Setup provider: agentforge provider --login <openrouter|copilot>'));
+    console.log(chalk.gray('  • Run wizard:     agentforge config --setup'));
+    console.log(chalk.gray('  • Start chat:     agentforge chat'));
     console.log();
   });
 
 // Helper functions
 async function setupApiKey(config: any) {
-  console.log(chalk.bold.cyan('\n⚙️  Configuration Setup\n'));
+  console.log(boxen(
+    chalk.bold.cyan('OpenRouter Setup') + '\n\n' +
+    chalk.gray('Paste your OpenRouter API key to enable chat immediately.') + '\n' +
+    chalk.gray('You can create one at: ') + chalk.cyan('https://openrouter.ai/keys'),
+    { padding: 1, borderColor: 'cyan', width: getPanelWidth(72, 96) }
+  ));
+
+  const existingKey = config.get('openrouter.apiKey') || '';
+  const existingModel = config.get('openrouter.model') || 'anthropic/claude-sonnet-4-20250514';
   
   const answers = await inquirer.prompt([
     {
       type: 'password',
       name: 'apiKey',
-      message: 'OpenRouter API Key:',
+      message: existingKey ? 'OpenRouter API Key (leave blank to keep current):' : 'OpenRouter API Key:',
       mask: '*',
-      validate: (input: string) => input.length > 10 || 'API key seems too short'
+      validate: (input: string) => {
+        if (!input && existingKey) return true;
+        return input.length > 10 || 'API key seems too short';
+      }
     },
     {
       type: 'list',
       name: 'model',
       message: 'Default AI Model:',
       choices: [
-        { name: 'Claude 3.5 Sonnet (Recommended)', value: 'anthropic/claude-3.5-sonnet' },
-        { name: 'GPT-4 Turbo', value: 'openai/gpt-4-turbo' },
-        { name: 'Gemini Pro', value: 'google/gemini-pro' },
-        { name: 'Llama 2', value: 'meta-llama/llama-2-70b-chat' }
+        { name: 'Claude Sonnet 4 (Recommended)', value: 'anthropic/claude-sonnet-4-20250514' },
+        { name: 'GPT-4o', value: 'openai/gpt-4o' },
+        { name: 'Claude 3.5 Sonnet', value: 'anthropic/claude-3.5-sonnet' },
+        { name: 'Gemini 1.5 Pro', value: 'google/gemini-1.5-pro' }
       ],
-      default: 0
+      default: existingModel
     }
   ]);
-  
-  config.set('openrouter.apiKey', answers.apiKey);
+
+  config.set('llm.provider', 'openrouter');
+  if (answers.apiKey) {
+    config.set('openrouter.apiKey', answers.apiKey);
+  }
   config.set('openrouter.model', answers.model);
-  
-  console.log(chalk.green('\n✓ Configuration saved!\n'));
+
+  console.log(chalk.green('\n✓ OpenRouter configuration saved.\n'));
+  console.log(chalk.gray('Next steps:'));
+  console.log(chalk.gray('  1) Verify provider: agentforge provider --list'));
+  console.log(chalk.gray('  2) Start chat:      agentforge chat\n'));
 }
 
 async function runSetupWizard(config: any) {
   console.log(boxen(
-    chalk.bold('AgentForge Setup Wizard'),
-    { padding: 1, borderColor: 'cyan' }
+    chalk.bold('AgentForge Setup Wizard') + '\n\n' +
+    chalk.gray('Configure provider, model, backend, and streaming in one flow.'),
+    { padding: 1, borderColor: 'cyan', width: getPanelWidth(72, 96) }
   ));
-  
+
+  const currentProvider = (config.get('llm.provider') || 'openrouter').toLowerCase();
+  const existingKey = config.get('openrouter.apiKey') || '';
+
   const answers = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'provider',
+      message: 'Primary provider:',
+      choices: [
+        { name: 'OpenRouter (API key)', value: 'openrouter' },
+        { name: 'GitHub Copilot (subscription)', value: 'copilot' }
+      ],
+      default: currentProvider === 'copilot' ? 'copilot' : 'openrouter'
+    },
     {
       type: 'password',
       name: 'apiKey',
       message: 'OpenRouter API Key:',
       mask: '*',
-      default: config.get('openrouter.apiKey') || '',
-      validate: (input: string) => input.length > 10 || 'API key seems too short'
+      when: (a: any) => a.provider === 'openrouter',
+      default: existingKey,
+      validate: (input: string, allAnswers: any) => {
+        if (allAnswers.provider !== 'openrouter') return true;
+        if (!input && existingKey) return true;
+        return input.length > 10 || 'API key seems too short';
+      }
     },
     {
       type: 'list',
       name: 'model',
       message: 'Default AI Model:',
+      when: (a: any) => a.provider === 'openrouter',
       choices: [
-        { name: 'Claude 3.5 Sonnet (Recommended)', value: 'anthropic/claude-3.5-sonnet' },
-        { name: 'GPT-4 Turbo', value: 'openai/gpt-4-turbo' },
-        { name: 'Gemini Pro', value: 'google/gemini-pro' },
-        { name: 'Llama 2', value: 'meta-llama/llama-2-70b-chat' }
+        { name: 'Claude Sonnet 4 (Recommended)', value: 'anthropic/claude-sonnet-4-20250514' },
+        { name: 'GPT-4o', value: 'openai/gpt-4o' },
+        { name: 'Claude 3.5 Sonnet', value: 'anthropic/claude-3.5-sonnet' },
+        { name: 'Gemini 1.5 Pro', value: 'google/gemini-1.5-pro' }
       ],
-      default: config.get('openrouter.model') || 'anthropic/claude-3.5-sonnet'
+      default: config.get('openrouter.model') || 'anthropic/claude-sonnet-4-20250514'
     },
     {
       type: 'input',
@@ -463,13 +533,27 @@ async function runSetupWizard(config: any) {
       default: config.get('cli.streamOutput') !== false
     }
   ]);
-  
-  config.set('openrouter.apiKey', answers.apiKey);
-  config.set('openrouter.model', answers.model);
+
+  config.set('llm.provider', answers.provider);
+  if (answers.provider === 'openrouter') {
+    if (answers.apiKey) {
+      config.set('openrouter.apiKey', answers.apiKey);
+    }
+    config.set('openrouter.model', answers.model);
+  }
   config.set('backend.url', answers.backendUrl);
   config.set('cli.streamOutput', answers.streamOutput);
-  
-  console.log(chalk.green('\n✓ Configuration saved!\n'));
+
+  console.log(chalk.green('\n✓ Setup complete.\n'));
+  if (answers.provider === 'copilot') {
+    console.log(chalk.gray('Next steps for Copilot:'));
+    console.log(chalk.gray('  1) Login:  agentforge provider --login copilot'));
+    console.log(chalk.gray('  2) Verify: agentforge provider --list'));
+  } else {
+    console.log(chalk.gray('Next steps for OpenRouter:'));
+    console.log(chalk.gray('  1) Verify: agentforge provider --list'));
+  }
+  console.log(chalk.gray('  3) Start:  agentforge chat\n'));
 }
 
 function displayConfig(config: any) {
@@ -480,7 +564,7 @@ function displayConfig(config: any) {
         k.includes('apiKey') ? chalk.gray('***') : v
       }`)
       .join('\n') || chalk.gray('No configuration set'),
-    { padding: 1, title: 'Configuration', borderColor: 'blue' }
+    { padding: 1, title: 'Configuration', borderColor: 'blue', width: getPanelWidth(72, 108) }
   ));
 }
 

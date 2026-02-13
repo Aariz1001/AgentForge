@@ -2,7 +2,7 @@ import { AppDataSource } from '../models/database';
 import { ToolTapeCompaction, ToolTapeEntry } from '../models/schema';
 import { settings } from '../core/config';
 import { MemoryEngine } from './memory/memory-engine';
-import { LessThan } from 'typeorm';
+import { LessThan, MoreThan } from 'typeorm';
 import crypto from 'crypto';
 
 export interface TapeCompactionReport {
@@ -13,6 +13,8 @@ export interface TapeCompactionReport {
   retained: number;
   deleted: number;
   createdCompactions: number;
+  dryRun?: boolean;
+  skippedReason?: string;
 }
 
 export interface MemoryCompactionReport {
@@ -20,11 +22,24 @@ export interface MemoryCompactionReport {
   summariesCreated: number;
   deleted: number;
   retained: number;
+  dryRun?: boolean;
+  skippedReason?: string;
 }
 
 export interface PhoenixCompactionReport {
   tape?: TapeCompactionReport;
   memory?: MemoryCompactionReport;
+}
+
+export interface PhoenixCompactorRuntimeStatus {
+  tapeRunning: boolean;
+  memoryRunning: boolean;
+  lastTapeCompactionAt?: string;
+  lastMemoryCompactionAt?: string;
+  lastTapeCompactionError?: string;
+  lastMemoryCompactionError?: string;
+  lastTapeReport?: TapeCompactionReport;
+  lastMemoryReport?: MemoryCompactionReport;
 }
 
 const stableStringify = (value: any): string => {
@@ -76,7 +91,14 @@ export class PhoenixCompactorService {
   private memory: MemoryEngine;
   private tapeTimer: NodeJS.Timeout | null = null;
   private memoryTimer: NodeJS.Timeout | null = null;
-  private running = false;
+  private tapeRunning = false;
+  private memoryRunning = false;
+  private lastTapeCompactionAt?: string;
+  private lastMemoryCompactionAt?: string;
+  private lastTapeCompactionError?: string;
+  private lastMemoryCompactionError?: string;
+  private lastTapeReport?: TapeCompactionReport;
+  private lastMemoryReport?: MemoryCompactionReport;
 
   constructor(memory: MemoryEngine) {
     this.memory = memory;
@@ -85,12 +107,16 @@ export class PhoenixCompactorService {
   start(): void {
     if (!this.tapeTimer) {
       this.tapeTimer = setInterval(() => {
-        void this.runTapeCompaction({ dryRun: false });
+        void this.runTapeCompaction({ dryRun: false }).catch((error: any) => {
+          this.lastTapeCompactionError = error?.message || String(error);
+        });
       }, settings.phoenixTape.compactionIntervalMs);
     }
     if (!this.memoryTimer) {
       this.memoryTimer = setInterval(() => {
-        void this.runMemoryCompaction();
+        void this.runMemoryCompaction().catch((error: any) => {
+          this.lastMemoryCompactionError = error?.message || String(error);
+        });
       }, settings.phoenixTape.memoryCompactionIntervalMs);
     }
   }
@@ -102,8 +128,23 @@ export class PhoenixCompactorService {
     this.memoryTimer = null;
   }
 
+  getRuntimeStatus(): PhoenixCompactorRuntimeStatus {
+    return {
+      tapeRunning: this.tapeRunning,
+      memoryRunning: this.memoryRunning,
+      lastTapeCompactionAt: this.lastTapeCompactionAt,
+      lastMemoryCompactionAt: this.lastMemoryCompactionAt,
+      lastTapeCompactionError: this.lastTapeCompactionError,
+      lastMemoryCompactionError: this.lastMemoryCompactionError,
+      lastTapeReport: this.lastTapeReport,
+      lastMemoryReport: this.lastMemoryReport
+    };
+  }
+
   async runTapeCompaction(options: { dryRun?: boolean } = {}): Promise<TapeCompactionReport> {
-    if (this.running || !AppDataSource.isInitialized) {
+    const dryRun = options.dryRun ?? false;
+
+    if (!AppDataSource.isInitialized) {
       return {
         windowStart: new Date().toISOString(),
         windowEnd: new Date().toISOString(),
@@ -111,13 +152,28 @@ export class PhoenixCompactorService {
         compactedGroups: 0,
         retained: 0,
         deleted: 0,
-        createdCompactions: 0
+        createdCompactions: 0,
+        dryRun,
+        skippedReason: 'database_not_initialized'
       };
     }
 
-    this.running = true;
+    if (this.tapeRunning) {
+      return {
+        windowStart: new Date().toISOString(),
+        windowEnd: new Date().toISOString(),
+        scanned: 0,
+        compactedGroups: 0,
+        retained: 0,
+        deleted: 0,
+        createdCompactions: 0,
+        dryRun,
+        skippedReason: 'already_running'
+      };
+    }
+
+    this.tapeRunning = true;
     try {
-      const dryRun = options.dryRun ?? false;
       const retentionDays = settings.phoenixTape.retentionDays;
       const windowHours = settings.phoenixTape.compactionWindowHours;
       const keepPerTool = settings.phoenixTape.compactionKeepPerTool;
@@ -143,7 +199,8 @@ export class PhoenixCompactorService {
         compactedGroups: 0,
         retained: 0,
         deleted: 0,
-        createdCompactions: 0
+        createdCompactions: 0,
+        dryRun
       };
 
       const groups = new Map<string, ToolTapeEntry[]>();
@@ -153,7 +210,9 @@ export class PhoenixCompactorService {
         groups.get(key)!.push(entry);
       }
 
+      let globalDeleted = 0;
       for (const [key, group] of groups.entries()) {
+        if (globalDeleted >= maxDeletes) break;
         if (group.length < minCount) continue;
 
         const [toolHash, contextFingerprint] = key.split(':');
@@ -188,28 +247,40 @@ export class PhoenixCompactorService {
         const sampleResults = scored.slice(0, 2).map(s => s.item.resultJson);
 
         if (!dryRun) {
-          const compaction = compactionRepo.create({
-            toolHash,
-            contextFingerprint: contextFingerprint === 'none' ? undefined : contextFingerprint,
-            windowStart,
-            windowEnd,
-            totalCount: group.length,
-            successCount,
-            failureCount,
-            distinctIdempotency,
-            digest,
-            summaryJson: {
+          const normalizedFingerprint = contextFingerprint === 'none' ? undefined : contextFingerprint;
+          const existingCompaction = await compactionRepo.findOne({
+            where: {
               toolHash,
-              contextFingerprint: contextFingerprint === 'none' ? null : contextFingerprint,
-              successRate: group.length ? successCount / group.length : 0,
-              representativeIds: Array.from(retained),
-              sampleArgs,
-              sampleResults,
-              failureSamples: scored.filter(s => s.item.status === 'failed').slice(0, 2).map(s => s.item.error)
+              contextFingerprint: normalizedFingerprint,
+              digest,
+              createdAt: MoreThan(new Date(Date.now() - 24 * 3600 * 1000))
             }
           });
-          await compactionRepo.save(compaction);
-          report.createdCompactions += 1;
+
+          if (!existingCompaction) {
+            const compaction = compactionRepo.create({
+              toolHash,
+              contextFingerprint: normalizedFingerprint,
+              windowStart,
+              windowEnd,
+              totalCount: group.length,
+              successCount,
+              failureCount,
+              distinctIdempotency,
+              digest,
+              summaryJson: {
+                toolHash,
+                contextFingerprint: normalizedFingerprint ?? null,
+                successRate: group.length ? successCount / group.length : 0,
+                representativeIds: Array.from(retained),
+                sampleArgs,
+                sampleResults,
+                failureSamples: scored.filter(s => s.item.status === 'failed').slice(0, 2).map(s => s.item.error)
+              }
+            });
+            await compactionRepo.save(compaction);
+            report.createdCompactions += 1;
+          }
         }
 
         report.compactedGroups += 1;
@@ -217,28 +288,56 @@ export class PhoenixCompactorService {
 
         let deleted = 0;
         for (const candidate of deleteCandidates) {
-          if (deleted >= maxDeletes) break;
+          if (globalDeleted >= maxDeletes) break;
           if (!dryRun) {
             await repository.delete(candidate.id);
           }
           deleted += 1;
+          globalDeleted += 1;
         }
         report.deleted += deleted;
       }
 
+      this.lastTapeCompactionAt = new Date().toISOString();
+      this.lastTapeCompactionError = undefined;
+      this.lastTapeReport = report;
       return report;
+    } catch (error: any) {
+      this.lastTapeCompactionError = error?.message || String(error);
+      throw error;
     } finally {
-      this.running = false;
+      this.tapeRunning = false;
     }
   }
 
   async runMemoryCompaction(): Promise<MemoryCompactionReport> {
-    const report = await this.memory.compact({
-      minClusterSize: 3,
-      keepPerCluster: 2,
-      createSummaries: true
-    });
+    if (this.memoryRunning) {
+      return {
+        clusters: 0,
+        summariesCreated: 0,
+        deleted: 0,
+        retained: 0,
+        skippedReason: 'already_running'
+      };
+    }
 
-    return report;
+    this.memoryRunning = true;
+    try {
+      const report = await this.memory.compact({
+        minClusterSize: 3,
+        keepPerCluster: 2,
+        createSummaries: true
+      });
+
+      this.lastMemoryCompactionAt = new Date().toISOString();
+      this.lastMemoryCompactionError = undefined;
+      this.lastMemoryReport = report;
+      return report;
+    } catch (error: any) {
+      this.lastMemoryCompactionError = error?.message || String(error);
+      throw error;
+    } finally {
+      this.memoryRunning = false;
+    }
   }
 }

@@ -13,6 +13,11 @@ import boxen from 'boxen';
 const agentGradient = gradient(['#00D9FF', '#00FF7F']);
 const forgeGradient = gradient(['#FF6B6B', '#FFD700', '#00FF7F']);
 
+function getDisplayWidth(min = 72, max = 104, margin = 4): number {
+  const cols = process.stdout.columns || 100;
+  return Math.min(max, Math.max(min, cols - margin));
+}
+
 /**
  * Display the welcome banner
  */
@@ -50,14 +55,15 @@ export function displayHelp() {
     { cmd: 'status', alias: '', desc: 'Check system status' }
   ];
   
-  console.log(chalk.bold('  Commands:\n'));
+  console.log(chalk.bold('  Commands\n'));
   
   for (const { cmd, alias, desc } of commands) {
     const aliasStr = alias ? chalk.gray(` (${alias})`) : '';
     console.log(`    ${chalk.cyan(cmd.padEnd(15))}${aliasStr.padEnd(6)} ${desc}`);
   }
   
-  console.log('\n  ' + chalk.gray('Run `agentforge <command> --help` for more info\n'));
+  console.log('\n  ' + chalk.gray('Run `agentforge <command> --help` for details'));
+  console.log('  ' + chalk.gray('Tip: Start interactive mode with `agentforge chat` or just `agentforge`') + '\n');
 }
 
 /**
@@ -85,8 +91,9 @@ export function formatToolResult(tool: string, result: any): string {
  * Display a section header
  */
 export function sectionHeader(title: string): void {
-  console.log('\n' + chalk.bold.cyan(` ${title.toUpperCase()} `));
-  console.log(chalk.gray(' '.repeat(2) + '─'.repeat(title.length + 2)));
+  const line = '─'.repeat(Math.min(Math.max(title.length + 6, 20), 70));
+  console.log('\n' + chalk.bold.cyan(` ${title} `));
+  console.log(chalk.gray(line));
 }
 
 /**
@@ -100,7 +107,8 @@ export function displayThinking(content: string): void {
     padding: { left: 2, right: 2, top: 0, bottom: 0 },
     borderColor: 'gray',
     dimBorder: true,
-    borderStyle: 'none'
+    borderStyle: 'none',
+    width: getDisplayWidth(72, 104, 6)
   }));
 }
 
@@ -184,7 +192,8 @@ export function displayError(message: string, details: string | null = null): vo
     { 
       padding: 1, 
       borderColor: 'red',
-      title: 'Error'
+      title: 'Error',
+      width: getDisplayWidth(72, 104)
     }
   ));
 }
@@ -244,7 +253,8 @@ export function codeBlock(code: string, language: string = ''): void {
   console.log(boxen(code, {
     padding: 1,
     borderColor: 'gray',
-    title: language || 'code'
+    title: language || 'code',
+    width: getDisplayWidth(72, 108)
   }));
 }
 

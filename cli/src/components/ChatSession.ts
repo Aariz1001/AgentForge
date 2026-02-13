@@ -160,6 +160,7 @@ export class ChatSession {
   private pendingContinuation: Promise<void> | null = null;
   private contextSummary: string | null = null;
   private compactingContext: boolean = false;
+  private lastContextCompactionErrorAt: number = 0;
   private permittedTools: Set<string> = new Set();
   private pendingImage: string | null = null;
   private interrupted: boolean = false;
@@ -386,8 +387,9 @@ export class ChatSession {
       chalk.white('Session:  ') + chalk.gray(this.sessionId) + '\n' +
       chalk.white('Provider: ') + chalk.cyan(providerDisplay) + '\n' +
       chalk.white('Model:    ') + chalk.cyan(this.model) + '\n\n' +
-      chalk.gray('Commands: /help   Exit: /exit   Interrupt: Ctrl+C (twice)')
-    , { padding: 1, borderColor: 'cyan' }));
+      chalk.gray('Commands: /help   Exit: /exit   Interrupt: Ctrl+C (twice)') + '\n' +
+      this.getQuickHelpLine()
+    , { padding: 1, borderColor: 'cyan', width: this.getPanelWidth(74, 100) }));
     
     while (this.running) {
       try {
@@ -506,6 +508,51 @@ export class ChatSession {
       { name: 'cancel', description: 'Cancel current operation (ESC)', usage: '/cancel' },
       { name: 'interrupt', description: 'Interrupt agent response (ESC)', usage: '/interrupt' }
     ];
+  }
+
+  private getQuickHelpLine(): string {
+    return chalk.gray('Tips: type a message to chat • type / for command palette • /help for all commands');
+  }
+
+  private getPanelWidth(min = 74, max = 104, margin = 4): number {
+    const cols = process.stdout.columns || 100;
+    return Math.min(max, Math.max(min, cols - margin));
+  }
+
+  private getClosestCommands(inputCmd: string, limit: number = 3): string[] {
+    const normalized = (inputCmd || '').toLowerCase().trim();
+    if (!normalized) return [];
+
+    const commandNames = Array.from(new Set(this.getCommands().map(c => c.name.toLowerCase())));
+
+    const distance = (a: string, b: string): number => {
+      const rows = a.length + 1;
+      const cols = b.length + 1;
+      const matrix: number[][] = Array.from({ length: rows }, () => Array(cols).fill(0));
+
+      for (let i = 0; i < rows; i++) matrix[i][0] = i;
+      for (let j = 0; j < cols; j++) matrix[0][j] = j;
+
+      for (let i = 1; i < rows; i++) {
+        for (let j = 1; j < cols; j++) {
+          const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+          matrix[i][j] = Math.min(
+            matrix[i - 1][j] + 1,
+            matrix[i][j - 1] + 1,
+            matrix[i - 1][j - 1] + cost
+          );
+        }
+      }
+
+      return matrix[a.length][b.length];
+    };
+
+    return commandNames
+      .map(name => ({ name, score: distance(normalized, name) }))
+      .sort((a, b) => a.score - b.score)
+      .filter(item => item.score <= Math.max(2, Math.floor(normalized.length / 2)))
+      .slice(0, limit)
+      .map(item => item.name);
   }
 
   async promptUser(): Promise<void> {
@@ -791,7 +838,13 @@ export class ChatSession {
           
         default:
           console.log(chalk.yellow(`Unknown command: ${cmd}`));
-          console.log(chalk.gray('Type /help for available commands'));
+          {
+            const suggestions = this.getClosestCommands(cmd);
+            if (suggestions.length > 0) {
+              console.log(chalk.gray(`Did you mean: ${suggestions.map(s => chalk.cyan('/' + s)).join(', ')} ?`));
+            }
+          }
+          console.log(chalk.gray('Type / for command palette or /help for available commands'));
       }
     } catch (error: any) {
       displayError(`Command failed: ${cmd}`, error.message);
@@ -801,6 +854,7 @@ export class ChatSession {
   showHelp(): void {
     console.log(boxen(
       chalk.bold('Commands:\n\n') +
+      chalk.gray('Tip: Type ') + chalk.cyan('/') + chalk.gray(' to open the command picker anytime.') + '\n\n' +
       chalk.cyan('Session & Navigation:\n') +
       '/exit, /q          Exit the session\n' +
       '/clear, /c         Clear screen\n' +
@@ -835,7 +889,7 @@ export class ChatSession {
       '/interrupt         Interrupt agent response\n\n' +
       '/swarm <task>      Run swarm mode\n' +
       '/help, /h          Show this help',
-      { padding: 1, borderColor: 'blue', title: 'Help' }
+      { padding: 1, borderColor: 'blue', title: 'Help', width: this.getPanelWidth(74, 100) }
     ));
   }
   
@@ -860,16 +914,22 @@ export class ChatSession {
   }
   
   showTools(): void {
-    console.log(chalk.bold('\nAvailable Tools:\n'));
-    
-    for (const [name, tool] of Object.entries(tools)) {
-      console.log(`  ${chalk.cyan(name.padEnd(12))} ${(tool as any).description}`);
+    const toolRows = Object.entries(tools)
+      .map(([name, tool]) => ({ name, tool: tool as any }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    console.log(chalk.bold(`\nAvailable Tools (${toolRows.length}):\n`));
+
+    for (const { name, tool } of toolRows) {
+      const source = tool.source === 'forged-core' ? chalk.yellow('[local]') : chalk.gray('[core]');
+      const description = (tool.description || '').slice(0, 90);
+      console.log(`  ${chalk.cyan(name.padEnd(28))} ${source} ${description}`);
     }
     
     // Show MCP server tools
     const mcpServers = this.sessionManager.listMCPServers().filter(s => s.enabled);
     if (mcpServers.length > 0) {
-      console.log(chalk.bold('\nMCP Server Tools:\n'));
+      console.log(chalk.bold(`\nMCP Server Tools (${mcpServers.length}):\n`));
       for (const server of mcpServers) {
         console.log(`  ${chalk.magenta(server.name.padEnd(12))} ${chalk.gray(server.url)}`);
       }
@@ -878,7 +938,7 @@ export class ChatSession {
     // Show enabled skills
     const skills = this.sessionManager.getEnabledSkills();
     if (skills.length > 0) {
-      console.log(chalk.bold('\nEnabled Skills:\n'));
+      console.log(chalk.bold(`\nEnabled Skills (${skills.length}):\n`));
       for (const skill of skills) {
         console.log(`  ${chalk.yellow(skill.name.padEnd(12))} ${skill.description}`);
       }
@@ -1279,22 +1339,71 @@ export class ChatSession {
       const status = await this.client.getPhoenixStatus();
       const toolTape = status?.toolTape || {};
       const statuses = toolTape.statuses || {};
+      const compactor = status?.compactor || {};
+      const phoenixSettings = status?.settings || {};
       console.log(chalk.bold('\nPhoenixTape Status:\n'));
       console.log(`${chalk.cyan('Total entries:')} ${toolTape.total ?? 0}`);
       for (const [key, value] of Object.entries(statuses)) {
         console.log(`${chalk.gray(`  ${key}`)}: ${value}`);
       }
       console.log(`${chalk.cyan('Memory entries:')} ${status?.memory?.entries ?? 0}`);
+
+      console.log(chalk.cyan('Compactor runtime:'));
+      console.log(chalk.gray(`  tapeRunning: ${compactor.tapeRunning ? 'yes' : 'no'}`));
+      console.log(chalk.gray(`  memoryRunning: ${compactor.memoryRunning ? 'yes' : 'no'}`));
+      if (compactor.lastTapeCompactionAt) {
+        console.log(chalk.gray(`  lastTapeCompactionAt: ${compactor.lastTapeCompactionAt}`));
+      }
+      if (compactor.lastMemoryCompactionAt) {
+        console.log(chalk.gray(`  lastMemoryCompactionAt: ${compactor.lastMemoryCompactionAt}`));
+      }
+      if (compactor.lastTapeCompactionError) {
+        console.log(chalk.red(`  lastTapeError: ${compactor.lastTapeCompactionError}`));
+      }
+      if (compactor.lastMemoryCompactionError) {
+        console.log(chalk.red(`  lastMemoryError: ${compactor.lastMemoryCompactionError}`));
+      }
+
+      console.log(chalk.cyan('Compaction settings:'));
+      console.log(chalk.gray(`  retentionDays: ${phoenixSettings.retentionDays ?? 'n/a'}`));
+      console.log(chalk.gray(`  windowHours: ${phoenixSettings.compactionWindowHours ?? 'n/a'}`));
+      console.log(chalk.gray(`  minCount: ${phoenixSettings.compactionMinCount ?? 'n/a'}`));
+      console.log(chalk.gray(`  keepPerTool: ${phoenixSettings.compactionKeepPerTool ?? 'n/a'}`));
+      console.log(chalk.gray(`  maxDeletes: ${phoenixSettings.compactionMaxDeletes ?? 'n/a'}`));
       console.log('');
       return;
     }
 
     if (subCmd === 'compact') {
       const mode = (args[1] || 'full').toLowerCase() as 'full' | 'tape' | 'memory';
+      if (!['full', 'tape', 'memory'].includes(mode)) {
+        console.log(chalk.yellow(`Invalid mode: ${mode}`));
+        console.log(chalk.gray('Usage: /phoenix compact [tape|memory|full] [dry]'));
+        return;
+      }
       const dryRun = args.includes('dry');
       const response = await this.client.runPhoenixCompaction(mode, dryRun);
       console.log(chalk.bold('\nPhoenixTape Compaction:\n'));
-      console.log(JSON.stringify(response?.report || {}, null, 2));
+      const report = response?.report || {};
+      if (report.tape) {
+        const tape = report.tape;
+        console.log(chalk.cyan('Tape:'));
+        console.log(chalk.gray(`  scanned=${tape.scanned} groups=${tape.compactedGroups} retained=${tape.retained} deleted=${tape.deleted} createdCompactions=${tape.createdCompactions}`));
+        if (tape.skippedReason) {
+          console.log(chalk.yellow(`  skippedReason=${tape.skippedReason}`));
+        }
+      }
+      if (report.memory) {
+        const memory = report.memory;
+        console.log(chalk.cyan('Memory:'));
+        console.log(chalk.gray(`  clusters=${memory.clusters} summariesCreated=${memory.summariesCreated} retained=${memory.retained} deleted=${memory.deleted}`));
+        if (memory.skippedReason) {
+          console.log(chalk.yellow(`  skippedReason=${memory.skippedReason}`));
+        }
+      }
+      if (!report.tape && !report.memory) {
+        console.log(chalk.gray(JSON.stringify(report, null, 2)));
+      }
       console.log('');
       return;
     }
@@ -1635,7 +1744,13 @@ export class ChatSession {
         detail = `LOC: ${chalk.green(`+${data.added ?? 0}`)}/${chalk.red(`-${data.removed ?? 0}`)}`;
         break;
       case 'shell':
-        detail = `exit: ${data.exitCode ?? 'n/a'} ${data.output ? `(${data.output})` : ''}`.trim();
+        {
+          const sandbox = data.sandbox ? `[${data.sandbox}]` : '';
+          const outputPreview = typeof data.output === 'string'
+            ? data.output.replace(/\s+/g, ' ').slice(0, 72)
+            : '';
+          detail = `exit: ${data.exitCode ?? 'n/a'} ${sandbox} ${outputPreview ? `• ${outputPreview}` : ''}`.trim();
+        }
         break;
       case 'env':
         detail = `${data.action ?? 'env'} ${data.type ?? ''}`.trim();
@@ -1649,7 +1764,9 @@ export class ChatSession {
     }
     }
 
-    const targetText = target ? chalk.gray(target) : chalk.gray('n/a');
+    const rawTarget = target ? String(target) : 'n/a';
+    const compactTargetRaw = rawTarget.length > 70 ? `${rawTarget.slice(0, 67)}...` : rawTarget;
+    const targetText = chalk.gray(compactTargetRaw);
     const status = result?.success ? chalk.green('✓') : chalk.red('✗');
     return `${status} ${chalk.cyan(name)} ${targetText} ${chalk.white(detail)}`;
   }
@@ -1838,6 +1955,7 @@ export class ChatSession {
     keepLast: number;
     summaryModel?: string;
     summaryMaxTokens: number;
+    summaryMaxInputChars: number;
   } {
     const cfg = this.config.get('openrouter.contextCompaction') || {};
     const enabled = cfg.enabled !== false;
@@ -1847,13 +1965,18 @@ export class ChatSession {
       ? cfg.summaryModel.trim()
       : undefined;
     const summaryMaxTokens = Number(cfg.summaryMaxTokens ?? 800);
+    const summaryMaxInputChars = Number(cfg.summaryMaxInputChars ?? 50000);
+
+    const normalizedMaxMessages = Math.max(10, maxMessages);
+    const normalizedKeepLast = Math.min(Math.max(5, keepLast), Math.max(5, normalizedMaxMessages - 1));
 
     return {
       enabled,
-      maxMessages: Math.max(10, maxMessages),
-      keepLast: Math.max(5, keepLast),
+      maxMessages: normalizedMaxMessages,
+      keepLast: normalizedKeepLast,
       summaryModel,
-      summaryMaxTokens: Math.max(128, summaryMaxTokens)
+      summaryMaxTokens: Math.max(128, summaryMaxTokens),
+      summaryMaxInputChars: Math.max(1000, summaryMaxInputChars)
     };
   }
 
@@ -1890,7 +2013,11 @@ export class ChatSession {
     const toSummarize = nonSystem.slice(0, Math.max(0, nonSystem.length - keepLast));
     if (toSummarize.length === 0) return;
 
-    const summaryInput = this.formatMessagesForSummary(toSummarize);
+    const rawSummaryInput = this.formatMessagesForSummary(toSummarize);
+    const summaryInput = rawSummaryInput.length > cfg.summaryMaxInputChars
+      ? rawSummaryInput.slice(-cfg.summaryMaxInputChars)
+      : rawSummaryInput;
+    if (!summaryInput.trim()) return;
     const summaryPrompt = `You are a context compaction engine. Summarize the conversation so far into a compact, durable memory for future steps.\n\nRequirements:\n- Capture decisions, constraints, progress, and open tasks.\n- Preserve file paths, APIs, commands, and tool results.\n- Keep it concise but complete.\n- Use bullet points and short sections.\n`;
 
     const previousSummary = this.contextSummary
@@ -1923,7 +2050,11 @@ export class ChatSession {
 
       this.sessionManager.addMessage('system', `Conversation summary (memory):\n${summary}`);
     } catch (error: any) {
-      displayError('Context compaction failed', error.message);
+      const now = Date.now();
+      if (now - this.lastContextCompactionErrorAt > 5 * 60 * 1000) {
+        displayError('Context compaction failed', error.message);
+        this.lastContextCompactionErrorAt = now;
+      }
     } finally {
       this.compactingContext = false;
     }
@@ -2484,6 +2615,7 @@ export class ChatSession {
       // Add tool result to conversation for context
       if (result && result.success === true) {
         let textContent = `[Tool ${name} succeeded: ${result.summary}]`;
+        const isExtendedToolkit = name.startsWith('Autonomous_Browser_Toolkit_') || name.startsWith('Virtual_Phone_Controller_');
         
         // Include output data if available and not too large
         if (result.data) {
@@ -2491,10 +2623,30 @@ export class ChatSession {
           
           // Remove potential heavy data from text dump to avoid token waste
           // since we'll handle screenshot specifically for vision
-          if (normalizedData.screenshot) delete normalizedData.screenshot;
+          if (normalizedData.screenshot) {
+            normalizedData.screenshotMeta = {
+              present: true,
+              estimatedBytes: Math.floor((String(normalizedData.screenshot).length * 3) / 4),
+              format: normalizedData.screenshotFormat || 'png/base64'
+            };
+            delete normalizedData.screenshot;
+          }
+
+          normalizedData.__agent_meta = {
+            tool: name,
+            success: true,
+            summary: result.summary,
+            timestamp: new Date().toISOString(),
+            input: args,
+            extendedToolkit: isExtendedToolkit
+          };
           
           const dataStr = JSON.stringify(normalizedData, null, 2);
-          const limit = (name === 'inventory' || name === 'mcp' || name === 'skill') ? 30000 : 15000;
+          const limit = isExtendedToolkit
+            ? 80000
+            : (name === 'inventory' || name === 'mcp' || name === 'skill')
+              ? 30000
+              : 15000;
           
           if (dataStr.length < limit) {
             textContent += `\nOutput:\n${dataStr}`;
@@ -2542,10 +2694,24 @@ export class ChatSession {
 
         let content = `[Tool ${name} failed. Reason: ${explanation}${detail}]`;
         if (result.data) {
+          const isExtendedToolkit = name.startsWith('Autonomous_Browser_Toolkit_') || name.startsWith('Virtual_Phone_Controller_');
           const normalizedData = name === 'shell'
             ? { ...result.data, output: result.data.fullOutput }
             : result.data;
-          content += `\nPartial Output/Error Details:\n${JSON.stringify(normalizedData, null, 2)}`;
+          const enriched = {
+            ...normalizedData,
+            __agent_meta: {
+              tool: name,
+              success: false,
+              summary: explanation,
+              timestamp: new Date().toISOString(),
+              input: args,
+              extendedToolkit: isExtendedToolkit
+            }
+          };
+          const raw = JSON.stringify(enriched, null, 2);
+          const limit = isExtendedToolkit ? 80000 : 20000;
+          content += `\nPartial Output/Error Details:\n${raw.length > limit ? `${raw.slice(0, limit)}... (truncated)` : raw}`;
         }
         content += `\n${usage}`;
 
@@ -3018,7 +3184,7 @@ Return ONLY the final, polished TypeScript code.`;
         (selectedModel.pricing ? 
           chalk.cyan('Price: ') + chalk.gray(`$${selectedModel.pricing.prompt}/prompt, $${selectedModel.pricing.completion}/completion`) 
           : ''),
-        { padding: 1, borderColor: 'green', title: 'Model' }
+        { padding: 1, borderColor: 'green', title: 'Model', width: this.getPanelWidth(74, 102) }
       ));
 
     } catch (error: any) {
@@ -3147,7 +3313,7 @@ Return ONLY the final, polished TypeScript code.`;
         info += chalk.cyan('Credit Limit: ') + chalk.gray('None');
       }
 
-      console.log(boxen(info, { padding: 1, borderColor: 'green', title: 'OpenRouter' }));
+      console.log(boxen(info, { padding: 1, borderColor: 'green', title: 'OpenRouter', width: this.getPanelWidth(74, 98) }));
     } catch (error: any) {
       spinner.stop();
       displayError('Failed to fetch credits', error.message);

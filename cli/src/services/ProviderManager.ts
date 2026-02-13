@@ -203,6 +203,8 @@ export class ProviderManager {
    */
   async displayStatus(): Promise<void> {
     console.log(chalk.bold('\n📡 LLM Provider Status\n'));
+    console.log(chalk.gray(`  Active provider: ${chalk.cyan(this.activeProvider)}`));
+    console.log('');
 
     const statuses = await this.getAllProvidersStatus();
 
@@ -227,6 +229,11 @@ export class ProviderManager {
       } else {
         console.log(`${chalk.red('○')} ${provider.displayName}${activeMarker}`);
         console.log(chalk.gray(`  └─ Not configured or unavailable`));
+        if (status.provider === 'openrouter') {
+          console.log(chalk.gray('  └─ Setup: agentforge provider --login openrouter'));
+        } else if (status.provider === 'copilot') {
+          console.log(chalk.gray('  └─ Setup: agentforge provider --login copilot'));
+        }
       }
     }
 
