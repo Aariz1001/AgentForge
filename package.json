@@ -29,6 +29,10 @@
   },
   "main": "dist/server/index.js",
   "type": "module",
+  "bin": {
+    "agentforge": "cli/bin/cli.cjs",
+    "af": "cli/bin/cli.cjs"
+  },
   "scripts": {
     "start:server": "tsx server/src/main.ts",
     "start:cli": "tsx cli/src/index.ts",

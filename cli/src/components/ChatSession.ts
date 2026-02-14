@@ -167,6 +167,10 @@ export class ChatSession {
   private activePrompt: readline.Interface | null = null;
   private originalConsoleLog: typeof console.log = console.log;
   private originalConsoleError: typeof console.error = console.error;
+  private interruptCount: number = 0;
+  private lastInterruptTime: number = 0;
+  private stickyPanelSuggestion: string = '';
+  private stickyPanelHeight: number = 8;
 
   constructor(options: any = {}) {
     this.config = options.config;
@@ -422,28 +426,14 @@ export class ChatSession {
     if (this.exitHandlerSet) return;
     this.exitHandlerSet = true;
 
-    let exitCount = 0;
-    let lastExitTime = 0;
-
     const handleExit = async () => {
       // If a prompt is active, let it handle SIGINT (usually closes the prompt)
       if (this.activePrompt) {
         return; 
       }
 
-      const now = Date.now();
-      
-      // Reset count if more than 2 seconds have passed
-      if (now - lastExitTime > 2000) {
-        exitCount = 0;
-      }
-      
-      exitCount++;
-      lastExitTime = now;
-
-      if (exitCount === 1) {
-        process.stdout.write(chalk.yellow('\n\n⚠ Press Ctrl+C again to exit AgentForge...\n'));
-      } else if (exitCount >= 2) {
+      const shouldExit = this.registerInterruptAttempt();
+      if (shouldExit) {
         this.running = false;
         await this.showExitStats();
         process.exit(0);
@@ -452,6 +442,24 @@ export class ChatSession {
 
     process.on('SIGINT', handleExit);
     process.on('SIGTERM', handleExit);
+  }
+
+  private registerInterruptAttempt(): boolean {
+    const now = Date.now();
+
+    if (now - this.lastInterruptTime > 2000) {
+      this.interruptCount = 0;
+    }
+
+    this.interruptCount++;
+    this.lastInterruptTime = now;
+
+    if (this.interruptCount === 1) {
+      process.stdout.write(chalk.yellow('\n\n⚠ Press Ctrl+C again to exit AgentForge...\n'));
+      return false;
+    }
+
+    return true;
   }
 
   private async showExitStats(): Promise<void> {
@@ -548,9 +556,23 @@ export class ChatSession {
     };
 
     return commandNames
-      .map(name => ({ name, score: distance(normalized, name) }))
+      .map(name => {
+        const editDistance = distance(normalized, name);
+        const exact = name === normalized ? 0 : 1;
+        const startsWith = name.startsWith(normalized) ? 0 : 1;
+        const includes = name.includes(normalized) ? 0 : 1;
+
+        return {
+          name,
+          score: exact * 1000 + startsWith * 100 + includes * 10 + editDistance
+        };
+      })
       .sort((a, b) => a.score - b.score)
-      .filter(item => item.score <= Math.max(2, Math.floor(normalized.length / 2)))
+      .filter(item => {
+        if (item.name.startsWith(normalized) || item.name.includes(normalized)) return true;
+        const maxDistance = Math.max(2, Math.floor(normalized.length / 2));
+        return (item.score % 10) <= maxDistance;
+      })
       .slice(0, limit)
       .map(item => item.name);
   }
@@ -603,6 +625,7 @@ export class ChatSession {
       }
       
       // Regular message
+      this.writeOutputLine(`${chalk.cyan('You:')} ${trimmed}`);
       await this.sendMessage(trimmed);
     } catch (err: any) {
       if (err.isTtyError || err.message?.includes('User force closed') || err.message?.includes('canceled') || err.message?.includes('cancelled')) {
@@ -624,28 +647,113 @@ export class ChatSession {
 
   private async readlineWithAutocomplete(commands: any[]): Promise<string> {
     return new Promise((resolve, reject) => {
-      let historyIndex = -1;
-      let tempInput = '';
+      const commandNames = Array.from(new Set(commands.map(c => c.name.toLowerCase())));
+      let lastSlashQuery = '';
+      let lastRenderedLine = '';
+      let lastRenderedSuggestion = '';
+      let renderQueued = false;
       
       const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout,
         terminal: true,
         historySize: 100,
-        prompt: chalk.blue('▶ ')
+        prompt: chalk.blue('▶ '),
+        completer: (line: string) => {
+          const trimmed = (line || '').trim();
+          if (!trimmed.startsWith('/')) {
+            return [[], line];
+          }
+
+          const commandInput = trimmed.slice(1).toLowerCase();
+          const matches = commandInput
+            ? this.getClosestCommands(commandInput, 8)
+            : commandNames;
+
+          const completions = matches.map(name => `/${name}`);
+          return [completions, line];
+        }
       });
 
       this.attachPrompt(rl);
-      this.printInputBorder('top');
 
       // Pre-populate history
       const reverseHistory = [...this.history].reverse();
       (rl as any).history = reverseHistory;
 
       rl.prompt();
+      this.renderStickyInputBox();
+
+      const inputStream = process.stdin as NodeJS.ReadStream;
+      const renderSlashPreview = () => {
+        const current = (rl.line || '').trim();
+        const isSlashMode = current.startsWith('/');
+
+        if (isSlashMode) {
+          const typed = current.slice(1).toLowerCase();
+          if (typed === lastSlashQuery) {
+            this.renderStickyInputBox();
+            return;
+          }
+
+          lastSlashQuery = typed;
+          const preview = typed
+            ? this.getClosestCommands(typed, 5).map(c => `/${c}`)
+            : commandNames.slice(0, 10).map(c => `/${c}`);
+
+          this.stickyPanelSuggestion = preview.length > 0
+            ? `Commands: ${preview.join('  ')}  (Tab to autocomplete)`
+            : '';
+        } else {
+          lastSlashQuery = '';
+          this.stickyPanelSuggestion = '';
+        }
+
+        const snapshotLine = rl.line || '';
+        const snapshotSuggestion = this.stickyPanelSuggestion;
+        if (snapshotLine === lastRenderedLine && snapshotSuggestion === lastRenderedSuggestion) {
+          return;
+        }
+
+        lastRenderedLine = snapshotLine;
+        lastRenderedSuggestion = snapshotSuggestion;
+        this.renderStickyInputBox();
+      };
+
+      const onData = (chunk: Buffer | string) => {
+        const value = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+        if (value.includes('\u001b')) {
+          this.triggerInterrupt('esc');
+          cleanupInputHooks();
+          this.detachPrompt();
+          rl.close();
+          resolve('');
+          return;
+        }
+
+        if (!renderQueued) {
+          renderQueued = true;
+          setTimeout(() => {
+            renderQueued = false;
+            renderSlashPreview();
+          }, 0);
+        }
+      };
+
+      if (inputStream && inputStream.isTTY) {
+        inputStream.on('data', onData);
+      }
+
+      const cleanupInputHooks = () => {
+        if (inputStream && inputStream.isTTY) {
+          inputStream.off('data', onData);
+        }
+        this.stickyPanelSuggestion = '';
+      };
 
       // Handle line submission
       rl.on('line', (line: string) => {
+        cleanupInputHooks();
         this.detachPrompt();
         rl.close();
         resolve(line.trim());
@@ -653,13 +761,21 @@ export class ChatSession {
 
       // Handle Ctrl+C
       rl.on('SIGINT', () => {
+        const shouldExit = this.registerInterruptAttempt();
+        cleanupInputHooks();
         this.detachPrompt();
         rl.close();
+
+        if (shouldExit) {
+          this.running = false;
+        }
+
         resolve('');
       });
 
       // Handle errors
       rl.on('close', () => {
+        cleanupInputHooks();
         this.detachPrompt();
       });
     });
@@ -674,10 +790,7 @@ export class ChatSession {
         return;
       }
 
-      readline.clearLine(process.stdout, 0);
-      readline.cursorTo(process.stdout, 0);
-      process.stdout.write(msg + '\n');
-      this.activePrompt.prompt(true);
+      this.printAboveStickyInput(msg);
     };
 
     console.log = (...args: any[]) => writeAbovePrompt(formatMessage(...args));
@@ -686,19 +799,258 @@ export class ChatSession {
 
   private detachPrompt(): void {
     this.activePrompt = null;
+    this.clearStickyInputBox();
     console.log = this.originalConsoleLog;
     console.error = this.originalConsoleError;
   }
 
   private writeOutputLine(message: string): void {
     if (this.activePrompt) {
-      readline.clearLine(process.stdout, 0);
-      readline.cursorTo(process.stdout, 0);
-      process.stdout.write(message + '\n');
-      this.activePrompt.prompt(true);
+      this.printAboveStickyInput(message);
       return;
     }
     process.stdout.write(message + '\n');
+  }
+
+  private clearStickyInputBox(): void {
+    if (!process.stdout.isTTY) return;
+    const rows = process.stdout.rows || 24;
+    const panelHeight = this.stickyPanelHeight || 8;
+    const startRow = Math.max(0, rows - panelHeight);
+    for (let i = 0; i < panelHeight; i++) {
+      readline.cursorTo(process.stdout, 0, startRow + i);
+      readline.clearLine(process.stdout, 0);
+    }
+    readline.cursorTo(process.stdout, 0, startRow);
+  }
+
+  private toPlainText(value: string): string {
+    return String(value || '').replace(/\x1B\[[0-9;]*m/g, '');
+  }
+
+  private fitPanelText(value: string, width: number): string {
+    const plain = this.toPlainText(value);
+    if (plain.length > width) {
+      return plain.slice(0, Math.max(0, width - 1)) + '…';
+    }
+    return plain.padEnd(width, ' ');
+  }
+
+  private wrapPanelText(value: string, firstWidth: number, nextWidth: number): string[] {
+    const text = this.toPlainText(value).replace(/\t/g, '  ');
+    if (!text) return [''];
+
+    const lines: string[] = [];
+    const paragraphs = text.split(/\r?\n/);
+
+    const pushWrapped = (paragraph: string, width: number) => {
+      const safeWidth = Math.max(1, width);
+      if (!paragraph.trim()) {
+        lines.push('');
+        return;
+      }
+
+      const words = paragraph.split(/\s+/).filter(Boolean);
+      let current = '';
+
+      for (const word of words) {
+        if (!current) {
+          if (word.length <= safeWidth) {
+            current = word;
+          } else {
+            for (let i = 0; i < word.length; i += safeWidth) {
+              const chunk = word.slice(i, i + safeWidth);
+              if (chunk.length === safeWidth) {
+                lines.push(chunk);
+              } else {
+                current = chunk;
+              }
+            }
+          }
+          continue;
+        }
+
+        if ((current.length + 1 + word.length) <= safeWidth) {
+          current += ` ${word}`;
+        } else {
+          lines.push(current);
+          if (word.length <= safeWidth) {
+            current = word;
+          } else {
+            current = '';
+            for (let i = 0; i < word.length; i += safeWidth) {
+              const chunk = word.slice(i, i + safeWidth);
+              if (chunk.length === safeWidth) {
+                lines.push(chunk);
+              } else {
+                current = chunk;
+              }
+            }
+          }
+        }
+      }
+
+      if (current) {
+        lines.push(current);
+      }
+    };
+
+    paragraphs.forEach((paragraph, index) => {
+      const width = index === 0 ? firstWidth : nextWidth;
+      pushWrapped(paragraph, width);
+      if (index < paragraphs.length - 1 && paragraph.trim()) {
+        lines.push('');
+      }
+    });
+
+    if (lines.length === 0) {
+      lines.push('');
+    }
+
+    return lines;
+  }
+
+  private paintStickyInputLines(lines: string[], startRow: number): void {
+    const previousHeight = this.stickyPanelHeight || 0;
+    const maxRows = Math.max(previousHeight, lines.length);
+
+    for (let i = 0; i < maxRows; i++) {
+      readline.cursorTo(process.stdout, 0, startRow + i);
+      readline.clearLine(process.stdout, 0);
+      if (i < lines.length) {
+        process.stdout.write(lines[i]);
+      }
+      if (i < maxRows - 1) {
+        process.stdout.write('\n');
+      }
+    }
+  }
+
+  private renderStickyInputBox(): void {
+    if (!this.activePrompt || !process.stdout.isTTY) return;
+
+    const cols = process.stdout.columns || 80;
+    const rows = process.stdout.rows || 24;
+    const panelWidth = Math.max(44, cols - 2);
+    const innerWidth = Math.max(20, panelWidth - 2);
+    const promptViewportRows = 4;
+    const promptPrefix = '› ';
+    const continuedPrefix = '  ';
+    const promptStartIndex = 4;
+
+    const promptValue = this.activePrompt.line || '';
+    const promptContent = promptValue.length > 0
+      ? promptValue
+      : 'Type @ to mention files or / for commands';
+    const suggestion = this.stickyPanelSuggestion || '';
+
+    const promptChunks = this.wrapPanelText(
+      promptContent,
+      innerWidth - promptPrefix.length,
+      innerWidth - continuedPrefix.length
+    );
+    const visiblePromptChunks = promptChunks.length > promptViewportRows
+      ? promptChunks.slice(-promptViewportRows)
+      : promptChunks;
+
+    const promptLines = Array.from({ length: promptViewportRows }, (_, rowIndex) => {
+      const chunk = visiblePromptChunks[rowIndex] || '';
+      const prefix = rowIndex === 0 ? promptPrefix : continuedPrefix;
+      const content = rowIndex === 0 ? `${prefix}${chunk}` : (chunk ? `${prefix}${chunk}` : continuedPrefix);
+      return chalk.gray('│') + this.fitPanelText(content, innerWidth) + chalk.gray('│');
+    });
+
+    if (promptChunks.length > promptViewportRows && promptLines.length > 0) {
+      const overflowHint = `${promptPrefix}… ${visiblePromptChunks[0] || ''}`;
+      promptLines[0] = chalk.gray('│') + this.fitPanelText(overflowHint, innerWidth) + chalk.gray('│');
+    }
+
+    const cwdDisplay = this.workingDirectory
+      ? this.workingDirectory.replace(process.env.HOME || '', '~')
+      : '~';
+
+    const lines = [
+      chalk.gray(`╭${'─'.repeat(innerWidth)}╮`),
+      chalk.gray(`│${' '.repeat(innerWidth)}│`),
+      chalk.gray(`│${this.fitPanelText(cwdDisplay, innerWidth)}│`),
+      chalk.gray(`├${'─'.repeat(innerWidth)}┤`),
+      ...promptLines,
+      chalk.gray(`│`) + chalk.cyan(this.fitPanelText(suggestion, innerWidth)) + chalk.gray(`│`),
+      chalk.gray(`│${this.fitPanelText('shift+tab switch mode • ctrl+q enqueue • esc interrupts', innerWidth)}│`),
+      chalk.gray(`╰${'─'.repeat(innerWidth)}╯`)
+    ];
+
+    const panelHeight = lines.length;
+    const startRow = Math.max(0, rows - panelHeight);
+
+    this.paintStickyInputLines(lines, startRow);
+    this.stickyPanelHeight = panelHeight;
+
+    const typedChunks = this.wrapPanelText(
+      promptValue,
+      innerWidth - promptPrefix.length,
+      innerWidth - continuedPrefix.length
+    );
+    const visibleTyped = typedChunks.length > promptViewportRows
+      ? typedChunks.slice(-promptViewportRows)
+      : typedChunks;
+    const visibleRowIndex = Math.max(0, visibleTyped.length - 1);
+    const lastChunk = visibleTyped[visibleRowIndex] || '';
+    const prefixWidth = visibleRowIndex === 0 ? promptPrefix.length : continuedPrefix.length;
+    const cursorRow = startRow + promptStartIndex + visibleRowIndex;
+    const cursorCol = Math.min(panelWidth - 2, 1 + prefixWidth + this.toPlainText(lastChunk).length);
+    readline.cursorTo(process.stdout, Math.max(3, cursorCol), cursorRow);
+  }
+
+  private triggerInterrupt(source: 'esc' | 'command'): void {
+    this.interrupted = true;
+    this.toolQueueNeedsContinuation = false;
+    this.continuationScheduled = false;
+    this.toolQueue = [];
+    this.stickyPanelSuggestion = source === 'esc'
+      ? 'Interrupted via ESC'
+      : 'Operation cancelled';
+  }
+
+  private installEscInterruptWatcher(): () => void {
+    const input = process.stdin as NodeJS.ReadStream & { setRawMode?: (mode: boolean) => void; isRaw?: boolean };
+    if (!input || !input.isTTY) {
+      return () => {};
+    }
+
+    const wasRaw = !!input.isRaw;
+    if (input.setRawMode && !wasRaw) {
+      input.setRawMode(true);
+    }
+    input.resume();
+
+    const onData = (chunk: Buffer | string) => {
+      const value = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      if (value.includes('\u001b')) {
+        this.triggerInterrupt('esc');
+        this.writeOutputLine(chalk.yellow('\n⚠ Interrupted (ESC).'));
+      }
+    };
+
+    input.on('data', onData);
+
+    return () => {
+      input.off('data', onData);
+      if (input.setRawMode && !wasRaw) {
+        input.setRawMode(false);
+      }
+    };
+  }
+
+  private printAboveStickyInput(message: string): void {
+    if (!this.activePrompt || !process.stdout.isTTY) {
+      this.originalConsoleLog(message);
+      return;
+    }
+
+    this.clearStickyInputBox();
+    this.originalConsoleLog(message);
+    this.renderStickyInputBox();
   }
 
   printInputBorder(position: 'top' | 'bottom'): void {
@@ -832,7 +1184,7 @@ export class ChatSession {
 
         case 'cancel':
         case 'interrupt':
-          this.interrupted = true;
+          this.triggerInterrupt('command');
           console.log(chalk.yellow('Operation cancelled'));
           break;
           
@@ -1825,6 +2177,12 @@ export class ChatSession {
 
     try {
       while (this.toolQueue.length > 0) {
+        if (this.interrupted) {
+          this.toolQueue = [];
+          this.toolQueueNeedsContinuation = false;
+          break;
+        }
+
         const item = this.toolQueue.shift();
         if (!item) break;
 
@@ -1858,6 +2216,12 @@ export class ChatSession {
     // Then handle continuation if needed
     try {
       while (this.toolQueueNeedsContinuation && this.running && !this.continuationScheduled) {
+        if (this.interrupted) {
+          this.toolQueueNeedsContinuation = false;
+          this.toolQueue = [];
+          break;
+        }
+
         this.continuationScheduled = true;
         this.toolQueueNeedsContinuation = false;
         
@@ -2064,6 +2428,8 @@ export class ChatSession {
     if (this.activePrompt) {
       this.detachPrompt();
     }
+
+    const removeEscWatcher = this.installEscInterruptWatcher();
 
     if (!content) {
       this.currentTurnCount++;
@@ -2313,6 +2679,11 @@ export class ChatSession {
       
       this.messages.push({ role: 'assistant', content: response });
       this.sessionManager.addMessage('assistant', response);
+
+      if (this.interrupted) {
+        this.writeOutputLine(chalk.yellow('⏹ Agent operation interrupted.'));
+        return;
+      }
       
       // Process any tool calls in the response and handle continuation loop
       try {
@@ -2332,6 +2703,8 @@ export class ChatSession {
       if (this.config.get('cli.verboseErrors')) {
         console.log(chalk.gray(error.stack));
       }
+    } finally {
+      removeEscWatcher();
     }
   }
 
@@ -2418,6 +2791,11 @@ export class ChatSession {
   }
   
   async executeTool(toolCall: any): Promise<void> {
+    if (this.interrupted) {
+      this.writeOutputLine(chalk.yellow('  → interrupted: skipping tool execution'));
+      return;
+    }
+
     const { name, args } = toolCall;
     const tool = (tools as any)[name];
     

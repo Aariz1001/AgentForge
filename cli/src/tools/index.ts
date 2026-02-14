@@ -563,7 +563,7 @@ export async function shell(command: string, options: any = {}): Promise<ToolRes
     isBackground = false,
     unsafe = false,
     allowOutsideWorkspace = false,
-    sandbox = process.env.AGENTFORGE_SHELL_SANDBOX || 'docker',
+    sandbox = process.env.AGENTFORGE_SHELL_SANDBOX || 'host',
     dockerImage = DEFAULT_DOCKER_SANDBOX_IMAGE
   } = options;
   
@@ -1000,7 +1000,7 @@ export async function packageTool(action: string, packages: any, options: any = 
  * Diagnostic Tool - Check for syntax and type errors
  */
 export async function checkTool(path: string = '.', options: any = {}): Promise<ToolResult> {
-  const { type = 'auto', sandbox = process.env.AGENTFORGE_SHELL_SANDBOX || 'docker' } = options;
+  const { type = 'auto', sandbox = process.env.AGENTFORGE_SHELL_SANDBOX || 'host' } = options;
   
   try {
     const absolutePath = resolve(path);
